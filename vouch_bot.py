@@ -16,7 +16,10 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional but recommended for fast slash comm
 
 logging.basicConfig(level=logging.INFO)
 
-DB_PATH = "/app/vouchbot.db"
+DB_DIR = "/app/data"
+os.makedirs(DB_DIR, exist_ok=True)
+DB_PATH = os.path.join(DB_DIR, "vouchbot.db")
+
 TRADE_EXPIRE_SECONDS = 3 * 60 * 60  # 3 hours
 
 # Trade channel reminder (anti-spam)
@@ -879,3 +882,4 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
