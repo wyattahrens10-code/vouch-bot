@@ -16,7 +16,7 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional but recommended for fast slash comm
 
 logging.basicConfig(level=logging.INFO)
 
-DB_DIR = "/app/data"
+DB_DIR = "/data"
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "vouchbot.db")
 
@@ -30,6 +30,17 @@ _trade_chat_counter = 0
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logging.exception("App command error: %s", error)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("⚠️ Error running that command. Check bot logs.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ Error running that command. Check bot logs.", ephemeral=True)
+    except Exception:
+        pass
 
 # -------------------- DB --------------------
 def db():
@@ -882,4 +893,5 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
