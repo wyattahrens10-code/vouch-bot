@@ -273,6 +273,35 @@ def last_trades_for_user(guild_id: int, user_id: int, limit: int = 5) -> List[sq
             (guild_id, user_id, user_id, limit)
         ).fetchall()
         return rows
+def trade_stats_for_user(guild_id: int, user_id: int):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT status, COUNT(*) AS c
+            FROM trades
+            WHERE guild_id = ?
+              AND (opener_id = ? OR partner_id = ?)
+            GROUP BY status
+            """,
+            (guild_id, user_id, user_id)
+        ).fetchall()
+
+    stats = {
+        "total": 0,
+        "completed": 0,
+        "failed": 0
+    }
+
+    for r in rows:
+        count = int(r["c"])
+        stats["total"] += count
+        status = str(r["status"])
+        if status == "completed":
+            stats["completed"] += count
+        elif status in ("cancelled", "expired", "declined"):
+            stats["failed"] += count
+
+    return stats
 
 # -------------------- Role logic --------------------
 @dataclass
@@ -885,43 +914,59 @@ async def rep(interaction: discord.Interaction, user: Optional[discord.Member] =
     embed.set_footer(text="Vouches require completed trades (Trade ID).")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="stats", description="Show a user's public trader stats")
-async def stats(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+@bot.tree.command(name="stats", description="Public trader stats & success rate")
+async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     user = user or interaction.user
     gid = interaction.guild.id
 
-    total = vouch_count(gid, user.id)
-    avg = avg_stars(gid, user.id)
+    # Vouch stats
+    total_vouches = vouch_count(gid, user.id)
+    avg_rating = avg_stars(gid, user.id)
+
+    # Trade stats
+    tstats = trade_stats_for_user(gid, user.id)
+    total_trades = tstats["total"]
+    completed = tstats["completed"]
+    failed = tstats["failed"]
+
+    success_rate = (completed / total_trades * 100) if total_trades > 0 else 0
+
+    # Recent trades
+    recent = last_trades_for_user(gid, user.id, limit=3)
+    recent_lines = []
+    for r in recent:
+        opener_id = int(r["opener_id"])
+        partner_id = int(r["partner_id"])
+        other_id = partner_id if user.id == opener_id else opener_id
+        other = interaction.guild.get_member(other_id)
+        other_txt = other.mention if other else f"<@{other_id}>"
+        recent_lines.append(f"`{r['trade_id']}` • **{str(r['status']).title()}** • with {other_txt}")
+
     eid = get_embark_id(gid, user.id)
 
-    cfg = get_config(gid)
-    tiers = get_tiers(cfg)
+    embed = discord.Embed(
+        title=f"📊 Trader Stats — {user.display_name}",
+        color=discord.Color.blurple()
+    )
 
-    achieved = "Unranked"
-    for t in tiers:
-        if t.role_id and total >= t.threshold:
-            achieved = t.name
-            break
-
-    # last 5 trades
-    rows = last_trades_for_user(gid, user.id, limit=5)
-    if rows:
-        trade_lines = []
-        for r in rows:
-            date_txt = time.strftime("%Y-%m-%d", time.localtime(int(r["created_at"])))
-            trade_lines.append(f"`{r['trade_id']}` • **{str(r['status']).title()}** • {date_txt}")
-        trade_history_text = "\n".join(trade_lines)
-    else:
-        trade_history_text = "*No trades yet*"
-
-    embed = discord.Embed(title="📊 Trader Stats", color=discord.Color.blurple())
-    embed.add_field(name="User", value=user.mention, inline=True)
     embed.add_field(name="Embark ID", value=f"`{eid}`" if eid else "*Not set*", inline=True)
-    embed.add_field(name="Tier", value=achieved, inline=True)
-    embed.add_field(name="Vouches", value=str(total), inline=True)
-    embed.add_field(name="Avg Rating", value=f"{avg:.2f}/5 ⭐", inline=True)
-    embed.add_field(name="Last 5 Trades", value=trade_history_text[:1024], inline=False)
-    embed.set_footer(text="Use /embark Name#1234 to set your in-game ID")
+    embed.add_field(name="Vouches", value=f"{total_vouches} • {avg_rating:.2f}/5 ⭐", inline=True)
+
+    embed.add_field(
+        name="🤝 Trade Activity",
+        value=(
+            f"• Total Trades: **{total_trades}**\n"
+            f"• Completed Trades: **{completed}**\n"
+            f"• Cancelled/Expired: **{failed}**\n"
+            f"• Success Rate: **{success_rate:.0f}%**"
+        ),
+        inline=False
+    )
+
+    if recent_lines:
+        embed.add_field(name="🗂 Recent Activity", value="\n".join(recent_lines), inline=False)
+
+    embed.set_footer(text="Public stats • Based on tracked trade tickets")
 
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
@@ -949,6 +994,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
