@@ -923,6 +923,24 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
     total_vouches = vouch_count(gid, user.id)
     avg_rating = avg_stars(gid, user.id)
 
+# Trader Tier
+cfg = get_config(gid)
+tiers = get_tiers(cfg)
+
+tier_name = "Unranked"
+tier_emoji = "—"
+
+for t in tiers:
+    if t.role_id and total_vouches >= t.threshold:
+        if t.name == "New Trader":
+            tier_emoji = "🆕"
+        elif t.name == "Verified Trader":
+            tier_emoji = "🪙"
+        elif t.name == "Trusted Trader":
+            tier_emoji = "🛡️"
+        tier_name = t.name
+        break
+
     # Trade stats
     tstats = trade_stats_for_user(gid, user.id)
     total_trades = tstats["total"]
@@ -951,6 +969,8 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
 
     embed.add_field(name="Embark ID", value=f"`{eid}`" if eid else "*Not set*", inline=True)
     embed.add_field(name="Vouches", value=f"{total_vouches} • {avg_rating:.2f}/5 ⭐", inline=True)
+embed.add_field(name="Trader Tier", value=f"{tier_emoji} {tier_name}", inline=True)
+
 
     embed.add_field(
         name="🤝 Trade Activity",
@@ -994,6 +1014,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
