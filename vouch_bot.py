@@ -19,6 +19,12 @@ logging.basicConfig(level=logging.INFO)
 DB_PATH = "/app/vouchbot.db"
 TRADE_EXPIRE_SECONDS = 3 * 60 * 60  # 3 hours
 
+# Trade channel reminder (anti-spam)
+TRADE_REMINDER_COOLDOWN = 30 * 60  # 30 minutes
+TRADE_REMINDER_MIN_MESSAGES = 12   # only remind after activity
+_last_trade_reminder_ts = 0
+_trade_chat_counter = 0
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -77,6 +83,17 @@ def init_db():
         )
         """)
 
+        # Profiles (Embark ID)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            embark_id TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """)
+
         # --- Safe migrations for your existing DB ---
         try:
             con.execute("ALTER TABLE guild_config ADD COLUMN trade_channel_id INTEGER")
@@ -115,6 +132,25 @@ def set_config_value(guild_id: int, key: str, value: int):
     with db() as con:
         con.execute(f"UPDATE guild_config SET {key} = ? WHERE guild_id = ?", (value, guild_id))
         con.commit()
+
+# -------------------- Profile helpers (Embark ID) --------------------
+def set_embark_id(guild_id: int, user_id: int, embark_id: str):
+    now = int(time.time())
+    with db() as con:
+        con.execute(
+            "INSERT INTO profiles (guild_id, user_id, embark_id, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET embark_id=excluded.embark_id, updated_at=excluded.updated_at",
+            (guild_id, user_id, embark_id, now)
+        )
+        con.commit()
+
+def get_embark_id(guild_id: int, user_id: int) -> Optional[str]:
+    with db() as con:
+        row = con.execute(
+            "SELECT embark_id FROM profiles WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone()
+        return (row["embark_id"] if row and row["embark_id"] else None)
 
 # -------------------- Vouch DB helpers --------------------
 def add_vouch(guild_id: int, trade_id: str, target_id: int, voucher_id: int, stars: int,
@@ -209,6 +245,21 @@ def find_expirable_trades(now_ts: int) -> List[sqlite3.Row]:
         ).fetchall()
         return rows
 
+def last_trades_for_user(guild_id: int, user_id: int, limit: int = 5) -> List[sqlite3.Row]:
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT trade_id, status, created_at, opener_id, partner_id
+            FROM trades
+            WHERE guild_id = ?
+              AND (opener_id = ? OR partner_id = ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (guild_id, user_id, user_id, limit)
+        ).fetchall()
+        return rows
+
 # -------------------- Role logic --------------------
 @dataclass
 class Tier:
@@ -274,6 +325,11 @@ def build_trade_embed(guild: discord.Guild, trade_id: str) -> discord.Embed:
     embed.add_field(name="Opener", value=opener.mention if opener else f"<@{trade['opener_id']}>", inline=True)
     embed.add_field(name="Partner", value=partner.mention if partner else f"<@{trade['partner_id']}>", inline=True)
 
+    opener_eid = get_embark_id(guild.id, int(trade["opener_id"])) if trade else None
+    partner_eid = get_embark_id(guild.id, int(trade["partner_id"])) if trade else None
+    embed.add_field(name="Opener Embark ID", value=f"`{opener_eid}`" if opener_eid else "*Not set*", inline=True)
+    embed.add_field(name="Partner Embark ID", value=f"`{partner_eid}`" if partner_eid else "*Not set*", inline=True)
+
     if status == "pending":
         embed.add_field(name="Status", value="Waiting for partner to accept or decline.", inline=False)
         embed.set_footer(text="Partner: click Accept/Decline • Auto-expires in 3 hours")
@@ -284,7 +340,7 @@ def build_trade_embed(guild: discord.Guild, trade_id: str) -> discord.Embed:
             value=f"Opener: {'✅' if oc else '⏳'} • Partner: {'✅' if pc else '⏳'}",
             inline=False
         )
-        embed.set_footer(text="Only the opener/partner can confirm • Auto-expires in 3 hours")
+        embed.set_footer(text="Only opener/partner can confirm • Staff can force close • Auto-expires in 3 hours")
     elif status == "completed":
         embed.add_field(name="Status", value="Completed ✅ — you may now vouch using this Trade ID.", inline=False)
         embed.set_footer(text="Use /vouch with the Trade ID (required)")
@@ -300,9 +356,18 @@ def build_trade_embed(guild: discord.Guild, trade_id: str) -> discord.Embed:
 
     return embed
 
-def build_vouch_embed(guild: discord.Guild, trade_id: str, trader: discord.Member, voucher: discord.Member,
-                     stars: int, total: int, avg: float, tier_update: Optional[str],
-                     note: Optional[str], proof_url: Optional[str]) -> discord.Embed:
+def build_vouch_embed(
+    guild: discord.Guild,
+    trade_id: str,
+    trader: discord.Member,
+    voucher: discord.Member,
+    stars: int,
+    total: int,
+    avg: float,
+    tier_update: Optional[str],
+    note: Optional[str],
+    proof_url: Optional[str]
+) -> discord.Embed:
     star_line = "⭐" * stars + "☆" * (5 - stars)
 
     embed = discord.Embed(
@@ -311,7 +376,11 @@ def build_vouch_embed(guild: discord.Guild, trade_id: str, trader: discord.Membe
         color=discord.Color.green()
     )
     embed.add_field(name="Trade ID", value=f"`{trade_id}`", inline=False)
+
+    trader_eid = get_embark_id(guild.id, trader.id)
     embed.add_field(name="Trader", value=trader.mention, inline=True)
+    embed.add_field(name="Embark ID", value=f"`{trader_eid}`" if trader_eid else "*Not set*", inline=True)
+
     embed.add_field(name="Vouched By", value=voucher.mention, inline=True)
     embed.add_field(name="Total Vouches", value=str(total), inline=True)
     embed.add_field(name="Avg Rating", value=f"**{avg:.2f}/5**", inline=True)
@@ -425,6 +494,24 @@ class ActiveTradeView(discord.ui.View):
         update_trade(trade_id, partner_confirmed=1)
         await self._refresh_or_finalize(interaction, trade_id)
 
+    @discord.ui.button(label="Force Close (Staff)", style=discord.ButtonStyle.danger, custom_id="trade_force_close")
+    async def force_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+
+        trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID from message.", ephemeral=True)
+
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+
+        update_trade(trade_id, status="cancelled")
+        embed = build_trade_embed(interaction.guild, trade_id)
+        embed.add_field(name="Staff Action", value=f"Force closed by {interaction.user.mention}", inline=False)
+        await interaction.response.edit_message(embed=embed, view=None)
+
     async def _refresh_or_finalize(self, interaction: discord.Interaction, trade_id: str):
         trade = get_trade(trade_id)
         if not trade:
@@ -464,6 +551,31 @@ async def expire_trades_loop():
         except Exception as e:
             logging.warning(f"Failed to expire/edit trade {trade_id}: {e}")
 
+# -------------------- Trade channel reminder (anti-spam) --------------------
+@bot.event
+async def on_message(message: discord.Message):
+    global _last_trade_reminder_ts, _trade_chat_counter
+
+    if message.author.bot or not message.guild:
+        return
+
+    cfg = get_config(message.guild.id)
+    trade_channel_id = int(cfg["trade_channel_id"] or 0)
+
+    if trade_channel_id and message.channel.id == trade_channel_id:
+        _trade_chat_counter += 1
+        now = int(time.time())
+
+        if _trade_chat_counter >= TRADE_REMINDER_MIN_MESSAGES and (now - _last_trade_reminder_ts) >= TRADE_REMINDER_COOLDOWN:
+            _last_trade_reminder_ts = now
+            _trade_chat_counter = 0
+            await message.channel.send(
+                "🧾 **Found a Raider to trade with?** Use **`/trade @user`** to open a Trade Ticket.\n"
+                "It keeps trades organized and unlocks vouches with a Trade ID ✅"
+            )
+
+    await bot.process_commands(message)
+
 # -------------------- Commands --------------------
 def admin_only(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
@@ -482,7 +594,6 @@ async def on_ready():
         await bot.tree.sync()
         logging.info("Synced global commands (can take time to appear)")
 
-    # Register persistent views (no DUMMY trade_id needed anymore)
     bot.add_view(PendingTradeView())
     bot.add_view(ActiveTradeView())
 
@@ -538,6 +649,36 @@ async def set_thresholds(interaction: discord.Interaction, new: int = 1, verifie
         ephemeral=True
     )
 
+# ---- Help ----
+@bot.tree.command(name="help", description="How to use DA VOUCHER")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="🤖 DA VOUCHER Help", color=discord.Color.blurple())
+    embed.add_field(name="Trading", value="`/trade @user` → open a ticket\nPartner Accepts → Trade → both Confirm", inline=False)
+    embed.add_field(name="Vouching", value="`/vouch @user trade_id stars` (Trade must be completed)", inline=False)
+    embed.add_field(name="Profiles", value="`/embark Name#1234` → save your in-game ID", inline=False)
+    embed.add_field(name="Rep", value="`/rep @user` (private) • `/toptraders` (public)", inline=False)
+    embed.add_field(name="History", value="`/trade_history @user` → last 5 trades (private)", inline=False)
+    embed.set_footer(text="Trade at your own risk • Staff can force close trades")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ---- Embark ID ----
+@bot.tree.command(name="embark", description="Set your Embark ID (example: Name#1234)")
+@app_commands.describe(embark_id="Example: RaiderName#1234")
+async def embark(interaction: discord.Interaction, embark_id: str):
+    embark_id = embark_id.strip()
+    if "#" not in embark_id:
+        return await interaction.response.send_message("Use format like: `Name#1234`", ephemeral=True)
+
+    name, tag = embark_id.split("#", 1)
+    if not name or not tag.isdigit() or not (3 <= len(tag) <= 6):
+        return await interaction.response.send_message("Use format like: `Name#1234` (numbers after #).", ephemeral=True)
+
+    if len(name) > 20:
+        return await interaction.response.send_message("Name part is too long. Keep it under ~20 chars.", ephemeral=True)
+
+    set_embark_id(interaction.guild.id, interaction.user.id, f"{name}#{tag}")
+    await interaction.response.send_message(f"✅ Saved your Embark ID as **`{name}#{tag}`**", ephemeral=True)
+
 # ---- Trade command ----
 @bot.tree.command(name="trade", description="Open a trade ticket with another user (posts in Trade Channel)")
 async def trade(interaction: discord.Interaction, user: discord.Member):
@@ -572,6 +713,31 @@ async def trade(interaction: discord.Interaction, user: discord.Member):
 
     msg = await trade_channel.send(content=f"{user.mention}", embed=embed, view=view)
     set_trade_message(trade_id, trade_channel.id, msg.id)
+
+# ---- Trade History ----
+@bot.tree.command(name="trade_history", description="Show a user's last 5 trades (private)")
+async def trade_history(interaction: discord.Interaction, user: discord.Member):
+    rows = last_trades_for_user(interaction.guild.id, user.id, limit=5)
+    if not rows:
+        return await interaction.response.send_message("No trades found for that user yet.", ephemeral=True)
+
+    lines = []
+    for r in rows:
+        opener_id = int(r["opener_id"])
+        partner_id = int(r["partner_id"])
+        other_id = partner_id if user.id == opener_id else opener_id
+        other = interaction.guild.get_member(other_id)
+        other_txt = other.mention if other else f"<@{other_id}>"
+        date_txt = time.strftime("%Y-%m-%d", time.localtime(int(r["created_at"])))
+        lines.append(f"`{r['trade_id']}` • **{str(r['status']).title()}** • with {other_txt} • {date_txt}")
+
+    embed = discord.Embed(
+        title=f"🗂️ Trade History — {user.display_name}",
+        description="\n".join(lines),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="Shows last 5 trades (any status)")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---- Vouch (trade_id + stars REQUIRED) ----
 @bot.tree.command(name="vouch", description="Leave a vouch (requires completed Trade ID)")
@@ -629,7 +795,6 @@ async def vouch(
     if voucher_id not in (opener_id, partner_id):
         return await interaction.response.send_message("Only trade participants can vouch for that trade.", ephemeral=True)
 
-    # Must vouch for the OTHER participant
     if {voucher_id, target_id} != {opener_id, partner_id}:
         return await interaction.response.send_message("You must vouch for the other person in that Trade ID.", ephemeral=True)
 
@@ -679,8 +844,11 @@ async def rep(interaction: discord.Interaction, user: Optional[discord.Member] =
             achieved = t.name
             break
 
+    eid = get_embark_id(gid, user.id)
+
     embed = discord.Embed(title="📈 Trader Rep", color=discord.Color.blurple())
     embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Embark ID", value=f"`{eid}`" if eid else "*Not set*", inline=True)
     embed.add_field(name="Vouches", value=str(total), inline=True)
     embed.add_field(name="Avg Rating", value=f"{avg:.2f}/5 ⭐", inline=True)
     embed.add_field(name="Tier", value=achieved, inline=True)
@@ -699,7 +867,9 @@ async def toptraders_cmd(interaction: discord.Interaction):
     for i, (uid, v, a) in enumerate(top, start=1):
         member = interaction.guild.get_member(uid)
         name = member.mention if member else f"<@{uid}>"
-        lines.append(f"**#{i}** {name} — **{v}** vouches — **{a:.2f}/5** ⭐")
+        eid = get_embark_id(gid, uid)
+        eid_txt = f" (`{eid}`)" if eid else ""
+        lines.append(f"**#{i}** {name}{eid_txt} — **{v}** vouches — **{a:.2f}/5** ⭐")
 
     embed = discord.Embed(title="🏆 Top Traders", description="\n".join(lines), color=discord.Color.gold())
     embed.set_footer(text="Ranked by vouches • Tie-breaker: avg rating")
