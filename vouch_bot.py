@@ -724,6 +724,22 @@ async def trade(interaction: discord.Interaction, user: discord.Member):
         f"Trade ticket created ✅ Posted in {trade_channel.mention}\nTrade ID: `{trade_id}`",
         ephemeral=True
     )
+    # Soft Embark-ID nudge (does NOT block trading)
+    opener_eid = get_embark_id(interaction.guild.id, interaction.user.id)
+    partner_eid = get_embark_id(interaction.guild.id, user.id)
+
+    tip_lines = []
+    if not opener_eid:
+        tip_lines.append("• You don’t have an Embark ID set. Use **`/embark Name#1234`**.")
+    if not partner_eid:
+        tip_lines.append(f"• {user.mention} doesn’t have an Embark ID set yet (it will show **Not set**).")
+
+    if tip_lines:
+        await interaction.followup.send(
+            "🧾 **Trade Tip**\n" + "\n".join(tip_lines) +
+            "\nSetting it makes adding each other in-game way faster ✅",
+            ephemeral=True
+        )
 
     msg = await trade_channel.send(content=f"{user.mention}", embed=embed, view=view)
     set_trade_message(trade_id, trade_channel.id, msg.id)
@@ -869,6 +885,46 @@ async def rep(interaction: discord.Interaction, user: Optional[discord.Member] =
     embed.set_footer(text="Vouches require completed trades (Trade ID).")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="stats", description="Show a user's public trader stats")
+async def stats(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    user = user or interaction.user
+    gid = interaction.guild.id
+
+    total = vouch_count(gid, user.id)
+    avg = avg_stars(gid, user.id)
+    eid = get_embark_id(gid, user.id)
+
+    cfg = get_config(gid)
+    tiers = get_tiers(cfg)
+
+    achieved = "Unranked"
+    for t in tiers:
+        if t.role_id and total >= t.threshold:
+            achieved = t.name
+            break
+
+    # last 5 trades
+    rows = last_trades_for_user(gid, user.id, limit=5)
+    if rows:
+        trade_lines = []
+        for r in rows:
+            date_txt = time.strftime("%Y-%m-%d", time.localtime(int(r["created_at"])))
+            trade_lines.append(f"`{r['trade_id']}` • **{str(r['status']).title()}** • {date_txt}")
+        trade_history_text = "\n".join(trade_lines)
+    else:
+        trade_history_text = "*No trades yet*"
+
+    embed = discord.Embed(title="📊 Trader Stats", color=discord.Color.blurple())
+    embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Embark ID", value=f"`{eid}`" if eid else "*Not set*", inline=True)
+    embed.add_field(name="Tier", value=achieved, inline=True)
+    embed.add_field(name="Vouches", value=str(total), inline=True)
+    embed.add_field(name="Avg Rating", value=f"{avg:.2f}/5 ⭐", inline=True)
+    embed.add_field(name="Last 5 Trades", value=trade_history_text[:1024], inline=False)
+    embed.set_footer(text="Use /embark Name#1234 to set your in-game ID")
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
+
 # ---- Leaderboard (public) ----
 @bot.tree.command(name="toptraders", description="Show top traders (public)")
 async def toptraders_cmd(interaction: discord.Interaction):
@@ -893,5 +949,6 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
