@@ -23,8 +23,8 @@ DB_PATH = os.path.join(DB_DIR, "vouchbot.db")
 TRADE_EXPIRE_SECONDS = 3 * 60 * 60  # 3 hours
 
 # Trade channel reminder (anti-spam)
-TRADE_REMINDER_COOLDOWN = 30 * 60  # 30 minutes
-TRADE_REMINDER_MIN_MESSAGES = 12   # only remind after activity
+TRADE_REMINDER_COOLDOWN = 5 * 60  # 5 minutes
+TRADE_REMINDER_MIN_MESSAGES = 4   # only remind after activity
 _last_trade_reminder_ts = 0
 _trade_chat_counter = 0
 
@@ -343,6 +343,57 @@ async def apply_roles(member: discord.Member, total_vouches: int) -> Optional[st
             return chosen.name
 
     return None
+
+# -------------------- Role display helpers --------------------
+REGION_ROLE_NAMES = ["🌎NA", "🌎EU", "🌎OCE", "🌎Asia", "🌎SA"]
+PLATFORM_ROLE_NAMES = ["🎮Console", "🖥️PC"]
+PLAYSTYLE_ROLE_NAMES = ["🟢 Casual", "🔴 Sweaty", "💰Traders", "🧠 Helper"]
+STAFF_ROLE_NAMES = ["🔨 Mods", "🧪 Trial Mods"]
+
+def _has_role_name(member: discord.Member, role_name: str) -> bool:
+    return any(r.name == role_name for r in member.roles)
+
+def pick_single_role_name(member: discord.Member, names: list[str]) -> Optional[str]:
+    for n in names:
+        if _has_role_name(member, n):
+            return n
+    return None
+
+def pick_multi_role_names(member: discord.Member, names: list[str]) -> list[str]:
+    return [n for n in names if _has_role_name(member, n)]
+
+def trader_tier_label(member: Optional[discord.Member], total_vouches: int, cfg) -> str:
+    # Prefer the actual tier roles on the member (most accurate)
+    if member:
+        for cfg_key in ("role_trusted_id", "role_verified_id", "role_new_id"):
+            rid = int(cfg[cfg_key] or 0)
+            if rid and any(r.id == rid for r in member.roles):
+                role = member.guild.get_role(rid)
+                return role.name if role else "Trader Tier"
+
+    # Fallback: compute from thresholds (in case roles weren't applied yet)
+    thresh_new = int(cfg["thresh_new"] or 1)
+    thresh_ver = int(cfg["thresh_verified"] or 5)
+    thresh_tru = int(cfg["thresh_trusted"] or 15)
+
+    if total_vouches >= thresh_tru:
+        return "🛡️ Trusted Trader"
+    if total_vouches >= thresh_ver:
+        return "🪙 Verified Trader"
+    if total_vouches >= thresh_new:
+        return "🆕 New Trader"
+    return "Unranked"
+
+def user_badges(member: Optional[discord.Member]) -> dict:
+    if not member:
+        return {"region": None, "platform": None, "playstyle": [], "staff": None}
+
+    region = pick_single_role_name(member, REGION_ROLE_NAMES)
+    platform = pick_single_role_name(member, PLATFORM_ROLE_NAMES)
+    playstyle = pick_multi_role_names(member, PLAYSTYLE_ROLE_NAMES)
+    staff = pick_single_role_name(member, STAFF_ROLE_NAMES)
+
+    return {"region": region, "platform": platform, "playstyle": playstyle, "staff": staff}
 
 # -------------------- Embeds --------------------
 def build_trade_embed(guild: discord.Guild, trade_id: str) -> discord.Embed:
@@ -891,27 +942,38 @@ async def vouch(
 async def rep(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     user = user or interaction.user
     gid = interaction.guild.id
+
     total = vouch_count(gid, user.id)
     avg = avg_stars(gid, user.id)
+    eid = get_embark_id(gid, user.id)
 
     cfg = get_config(gid)
-    tiers = get_tiers(cfg)
+    tier = trader_tier_label(user if isinstance(user, discord.Member) else None, total, cfg)
 
-    achieved = "Unranked"
-    for t in tiers:
-        if t.role_id and total >= t.threshold:
-            achieved = t.name
-            break
-
-    eid = get_embark_id(gid, user.id)
+    badges = user_badges(user if isinstance(user, discord.Member) else None)
 
     embed = discord.Embed(title="📈 Trader Rep", color=discord.Color.blurple())
     embed.add_field(name="User", value=user.mention, inline=True)
     embed.add_field(name="Embark ID", value=f"`{eid}`" if eid else "*Not set*", inline=True)
+    embed.add_field(name="Trader Tier", value=tier, inline=True)
+
     embed.add_field(name="Vouches", value=str(total), inline=True)
     embed.add_field(name="Avg Rating", value=f"{avg:.2f}/5 ⭐", inline=True)
-    embed.add_field(name="Tier", value=achieved, inline=True)
-    embed.set_footer(text="Vouches require completed trades (Trade ID).")
+
+    if badges["region"] or badges["platform"]:
+        embed.add_field(
+            name="Info",
+            value=f"{badges['region'] or '*No region*'} • {badges['platform'] or '*No platform*'}",
+            inline=False
+        )
+
+    if badges["playstyle"]:
+        embed.add_field(name="Raider Type", value=" • ".join(badges["playstyle"]), inline=False)
+
+    if badges["staff"]:
+        embed.add_field(name="Staff", value=badges["staff"], inline=False)
+
+    embed.set_footer(text="Private • Vouches require completed trades (Trade ID).")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="stats", description="Public trader stats & success rate")
@@ -923,31 +985,12 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
     total_vouches = vouch_count(gid, user.id)
     avg_rating = avg_stars(gid, user.id)
 
-    # Trader Tier
-    cfg = get_config(gid)
-    tiers = get_tiers(cfg)
-
-    tier_name = "Unranked"
-    tier_emoji = "—"
-
-    for t in tiers:
-        if t.role_id and total_vouches >= t.threshold:
-            if t.name == "New Trader":
-                tier_emoji = "🆕"
-            elif t.name == "Verified Trader":
-                tier_emoji = "🪙"
-            elif t.name == "Trusted Trader":
-                tier_emoji = "🛡️"
-            tier_name = t.name
-            break
-
     # Trade stats
     tstats = trade_stats_for_user(gid, user.id)
-    total_trades = int(tstats["total"])
-    completed = int(tstats["completed"])
-    failed = int(tstats["failed"])
-
-    success_rate = int((completed / total_trades) * 100) if total_trades > 0 else 0
+    total_trades = tstats["total"]
+    completed = tstats["completed"]
+    failed = tstats["failed"]
+    success_rate = (completed / total_trades * 100) if total_trades > 0 else 0
 
     # Recent trades
     recent = last_trades_for_user(gid, user.id, limit=3)
@@ -961,15 +1004,31 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
         recent_lines.append(f"`{r['trade_id']}` • **{str(r['status']).title()}** • with {other_txt}")
 
     eid = get_embark_id(gid, user.id)
+    cfg = get_config(gid)
+    tier = trader_tier_label(user if isinstance(user, discord.Member) else None, total_vouches, cfg)
+    badges = user_badges(user if isinstance(user, discord.Member) else None)
 
     embed = discord.Embed(
         title=f"📊 Trader Stats — {user.display_name}",
         color=discord.Color.blurple()
     )
 
+    embed.add_field(name="Trader Tier", value=tier, inline=True)
     embed.add_field(name="Embark ID", value=f"`{eid}`" if eid else "*Not set*", inline=True)
     embed.add_field(name="Vouches", value=f"{total_vouches} • {avg_rating:.2f}/5 ⭐", inline=True)
-    embed.add_field(name="Trader Tier", value=f"{tier_emoji} {tier_name}", inline=True)
+
+    if badges["region"] or badges["platform"]:
+        embed.add_field(
+            name="Region / Platform",
+            value=f"{badges['region'] or '*No region*'} • {badges['platform'] or '*No platform*'}",
+            inline=False
+        )
+
+    if badges["playstyle"]:
+        embed.add_field(name="Raider Type", value=" • ".join(badges["playstyle"]), inline=False)
+
+    if badges["staff"]:
+        embed.add_field(name="Staff", value=badges["staff"], inline=False)
 
     embed.add_field(
         name="🤝 Trade Activity",
@@ -977,7 +1036,7 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
             f"• Total Trades: **{total_trades}**\n"
             f"• Completed Trades: **{completed}**\n"
             f"• Cancelled/Expired: **{failed}**\n"
-            f"• Success Rate: **{success_rate}%**"
+            f"• Success Rate: **{success_rate:.0f}%**"
         ),
         inline=False
     )
@@ -986,26 +1045,31 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
         embed.add_field(name="🗂 Recent Activity", value="\n".join(recent_lines), inline=False)
 
     embed.set_footer(text="Public stats • Based on tracked trade tickets")
-
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
-# ---- Leaderboard (public) ----
 @bot.tree.command(name="toptraders", description="Show top traders (public)")
 async def toptraders_cmd(interaction: discord.Interaction):
     gid = interaction.guild.id
+    cfg = get_config(gid)
+
     top = top_traders(gid, limit=10)
     if not top:
         return await interaction.response.send_message("No vouches yet.", ephemeral=True)
 
-    lines = []
+    lines_out = []
     for i, (uid, v, a) in enumerate(top, start=1):
         member = interaction.guild.get_member(uid)
         name = member.mention if member else f"<@{uid}>"
-        eid = get_embark_id(gid, uid)
-        eid_txt = f" (`{eid}`)" if eid else ""
-        lines.append(f"**#{i}** {name}{eid_txt} — **{v}** vouches — **{a:.2f}/5** ⭐")
 
-    embed = discord.Embed(title="🏆 Top Traders", description="\n".join(lines), color=discord.Color.gold())
+        # Leaderboard extras: ONLY Region + Platform + Trader Tier
+        tier = trader_tier_label(member, v, cfg)
+        badges = user_badges(member)
+        tags = [t for t in [tier, badges["region"], badges["platform"]] if t and t != "Unranked"]
+
+        tag_txt = f" • {' • '.join(tags)}" if tags else ""
+        lines_out.append(f"**#{i}** {name} — **{v}** vouches — **{a:.2f}/5** ⭐{tag_txt}")
+
+    embed = discord.Embed(title="🏆 Top Traders", description="\n".join(lines_out), color=discord.Color.gold())
     embed.set_footer(text="Ranked by vouches • Tie-breaker: avg rating")
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
@@ -1013,9 +1077,3 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
-
-
-
-
-
-
