@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import random
 import string
+import re
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -23,10 +24,15 @@ DB_PATH = os.path.join(DB_DIR, "vouchbot.db")
 TRADE_EXPIRE_SECONDS = 3 * 60 * 60  # 3 hours
 
 # Trade channel reminder (anti-spam)
-TRADE_REMINDER_COOLDOWN = 5 * 60  # 5 minutes
-TRADE_REMINDER_MIN_MESSAGES = 4   # only remind after activity
+TRADE_REMINDER_COOLDOWN = 30 * 60  # 30 minutes
+TRADE_REMINDER_MIN_MESSAGES = 12   # only remind after activity
 _last_trade_reminder_ts = 0
 _trade_chat_counter = 0
+
+# Report system (scam / sketchy behavior)
+REPORT_CATEGORY_ID = 1460823073765720260  # Trading Hub category
+MOD_ROLE_ID = 1460828375613706403
+TRIAL_MOD_ROLE_ID = 1460828827206025329
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -56,6 +62,7 @@ def init_db():
             guild_id INTEGER PRIMARY KEY,
             vouch_channel_id INTEGER,
             trade_channel_id INTEGER,
+            report_receipts_channel_id INTEGER,
             role_new_id INTEGER,
             role_verified_id INTEGER,
             role_trusted_id INTEGER,
@@ -107,8 +114,33 @@ def init_db():
             PRIMARY KEY (guild_id, user_id)
         )
         """)
+        # Scam Reports
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            trade_id TEXT NOT NULL,
+            reporter_id INTEGER NOT NULL,
+            opener_id INTEGER NOT NULL,
+            partner_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            trade_details TEXT,
+            proof_url TEXT,
+            channel_id INTEGER,
+            message_id INTEGER,
+            created_at INTEGER NOT NULL,
+            resolved_at INTEGER,
+            resolved_by INTEGER
+        )
+        """)
+
 
         # --- Safe migrations for your existing DB ---
+        try:
+            con.execute("ALTER TABLE guild_config ADD COLUMN report_receipts_channel_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
         try:
             con.execute("ALTER TABLE guild_config ADD COLUMN trade_channel_id INTEGER")
         except sqlite3.OperationalError:
@@ -165,6 +197,55 @@ def get_embark_id(guild_id: int, user_id: int) -> Optional[str]:
             (guild_id, user_id)
         ).fetchone()
         return (row["embark_id"] if row and row["embark_id"] else None)
+# -------------------- Report DB helpers --------------------
+def create_report(
+    guild_id: int,
+    trade_id: str,
+    reporter_id: int,
+    opener_id: int,
+    partner_id: int,
+    description: str,
+    trade_details: Optional[str],
+    proof_url: Optional[str],
+    channel_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+) -> int:
+    now = int(time.time())
+    with db() as con:
+        cur = con.execute(
+            """
+            INSERT INTO reports (
+                guild_id, trade_id, reporter_id, opener_id, partner_id,
+                description, trade_details, proof_url, channel_id, message_id, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (guild_id, trade_id, reporter_id, opener_id, partner_id, description, trade_details, proof_url, channel_id, message_id, now)
+        )
+        con.commit()
+        return int(cur.lastrowid)
+
+def attach_report_channel(report_id: int, channel_id: int, message_id: int):
+    with db() as con:
+        con.execute(
+            "UPDATE reports SET channel_id=?, message_id=? WHERE id=?",
+            (channel_id, message_id, report_id)
+        )
+        con.commit()
+
+def get_report(report_id: int):
+    with db() as con:
+        return con.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+
+def resolve_report(report_id: int, resolver_id: int):
+    now = int(time.time())
+    with db() as con:
+        con.execute(
+            "UPDATE reports SET resolved_at=?, resolved_by=? WHERE id=?",
+            (now, resolver_id, report_id)
+        )
+        con.commit()
+
+
 
 # -------------------- Vouch DB helpers --------------------
 def add_vouch(guild_id: int, trade_id: str, target_id: int, voucher_id: int, stars: int,
@@ -507,6 +588,240 @@ def trade_id_from_message(interaction: discord.Interaction) -> Optional[str]:
 
     return None
 
+
+# -------------------- Reports UI --------------------
+def _parse_report_id_from_channel(channel: discord.abc.GuildChannel) -> Optional[int]:
+    # topic format: "report_id=123 trade_id=T-ABC123"
+    try:
+        topic = getattr(channel, "topic", None) or ""
+        m = re.search(r"report_id=(\d+)", topic)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+class ScamReportModal(discord.ui.Modal, title="Report Trade Issue"):
+    def __init__(self, trade_id: str):
+        super().__init__(timeout=None)
+        self.trade_id = trade_id
+
+        self.what_happened = discord.ui.TextInput(
+            label="What happened?",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=900,
+            placeholder="Explain what happened (keep it clear + short)."
+        )
+        self.trade_details = discord.ui.TextInput(
+            label="Trade details (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            placeholder="What items/GOOP were supposed to be traded?"
+        )
+        self.proof_url = discord.ui.TextInput(
+            label="Proof link (clip recommended)",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=200,
+            placeholder="Paste a clip/link if you have it (strongly recommended)."
+        )
+
+        self.add_item(self.what_happened)
+        self.add_item(self.trade_details)
+        self.add_item(self.proof_url)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        trade_id = self.trade_id.strip().upper()
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+
+        # Allow reporting on active trades only
+        if trade["status"] != "active":
+            return await interaction.response.send_message("Reports can only be filed while a trade is **Active**.", ephemeral=True)
+
+        opener_id = int(trade["opener_id"])
+        partner_id = int(trade["partner_id"])
+        reporter_id = interaction.user.id
+
+        if reporter_id not in (opener_id, partner_id):
+            return await interaction.response.send_message("Only trade participants can file a report.", ephemeral=True)
+
+        guild = interaction.guild
+        if not guild:
+            return await interaction.response.send_message("Server not found.", ephemeral=True)
+
+        # Create DB record first
+        desc = str(self.what_happened.value).strip()
+        details = str(self.trade_details.value).strip() if self.trade_details.value else None
+        proof = str(self.proof_url.value).strip() if self.proof_url.value else None
+
+        report_id = create_report(
+            guild_id=guild.id,
+            trade_id=trade_id,
+            reporter_id=reporter_id,
+            opener_id=opener_id,
+            partner_id=partner_id,
+            description=desc,
+            trade_details=details,
+            proof_url=proof,
+        )
+
+        # Find category
+        category = guild.get_channel(REPORT_CATEGORY_ID)
+        if category and not isinstance(category, discord.CategoryChannel):
+            category = None
+
+        # Create a unique channel name
+        base_name = f"report-{trade_id.lower()}"
+        name = base_name
+        existing_names = {c.name for c in guild.text_channels}
+        n = 2
+        while name in existing_names:
+            name = f"{base_name}-{n}"
+            n += 1
+
+        # Overwrites
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True),
+        }
+
+        reporter = guild.get_member(reporter_id)
+        opener = guild.get_member(opener_id)
+        partner = guild.get_member(partner_id)
+
+        for m in [reporter, opener, partner]:
+            if m:
+                overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+
+        mod_role = guild.get_role(MOD_ROLE_ID)
+        trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
+        for r in [mod_role, trial_role]:
+            if r:
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+
+        topic = f"report_id={report_id} trade_id={trade_id}"
+        report_channel = await guild.create_text_channel(
+            name=name,
+            category=category,
+            topic=topic,
+            overwrites=overwrites,
+            reason=f"Scam report for {trade_id}"
+        )
+
+        # Build report embed
+        accused_id = partner_id if reporter_id == opener_id else opener_id
+        accused = guild.get_member(accused_id)
+        accused_txt = accused.mention if accused else f"<@{accused_id}>"
+
+        embed = discord.Embed(title="🚨 Trade Report Opened", color=discord.Color.red())
+        embed.add_field(name="Report ID", value=f"`{report_id}`", inline=True)
+        embed.add_field(name="Trade ID", value=f"`{trade_id}`", inline=True)
+        embed.add_field(name="Reporter", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Other Trader", value=accused_txt, inline=True)
+        embed.add_field(name="What happened", value=desc[:1024], inline=False)
+
+        if details:
+            embed.add_field(name="Trade details", value=details[:1024], inline=False)
+        if proof:
+            embed.add_field(name="Proof", value=proof[:1024], inline=False)
+        else:
+            embed.add_field(name="Proof", value="*Not provided yet — clip is strongly recommended.*", inline=False)
+
+        embed.set_footer(text="Mods: use Mark Resolved when handled • You can add another trader if needed")
+
+        view = ReportChannelView()
+
+        ping = ""
+        if mod_role:
+            ping += mod_role.mention + " "
+        if trial_role:
+            ping += trial_role.mention + " "
+
+        msg = await report_channel.send(
+            content=(ping.strip() if ping else None),
+            embed=embed,
+            view=view
+        )
+
+        attach_report_channel(report_id, report_channel.id, msg.id)
+
+        await interaction.response.send_message(
+            f"✅ Report opened: {report_channel.mention}\n"
+            f"**Tip:** A clip/link is strongly recommended. You can post it in that channel any time.",
+            ephemeral=True
+        )
+
+class ReportChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Mark Resolved (Staff)", style=discord.ButtonStyle.success, custom_id="report_mark_resolved")
+    async def mark_resolved(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("This must be used in a report channel.", ephemeral=True)
+
+        report_id = _parse_report_id_from_channel(channel)
+        if not report_id:
+            return await interaction.response.send_message("Couldn't find Report ID for this channel.", ephemeral=True)
+
+        report = get_report(report_id)
+        if not report:
+            return await interaction.response.send_message("Report record not found.", ephemeral=True)
+
+        # Update DB
+        resolve_report(report_id, interaction.user.id)
+
+        guild = interaction.guild
+        cfg = get_config(guild.id)
+        receipts_id = int(cfg["report_receipts_channel_id"] or 0)
+
+        receipt_embed = discord.Embed(title="🧾 Report Receipt (Resolved)", color=discord.Color.green())
+        receipt_embed.add_field(name="Report ID", value=f"`{report_id}`", inline=True)
+        receipt_embed.add_field(name="Trade ID", value=f"`{report['trade_id']}`", inline=True)
+        receipt_embed.add_field(name="Reporter", value=f"<@{int(report['reporter_id'])}>", inline=True)
+        # show both traders for context
+        receipt_embed.add_field(name="Opener", value=f"<@{int(report['opener_id'])}>", inline=True)
+        receipt_embed.add_field(name="Partner", value=f"<@{int(report['partner_id'])}>", inline=True)
+        receipt_embed.add_field(name="What happened", value=str(report["description"])[:1024], inline=False)
+
+        if report["trade_details"]:
+            receipt_embed.add_field(name="Trade details", value=str(report["trade_details"])[:1024], inline=False)
+        if report["proof_url"]:
+            receipt_embed.add_field(name="Proof", value=str(report["proof_url"])[:1024], inline=False)
+
+        receipt_embed.add_field(name="Resolved By", value=interaction.user.mention, inline=True)
+
+        sent_to = None
+        if receipts_id:
+            receipts_ch = guild.get_channel(receipts_id)
+            if isinstance(receipts_ch, discord.TextChannel):
+                await receipts_ch.send(embed=receipt_embed)
+                sent_to = receipts_ch
+
+        # confirm in-channel
+        note = "✅ Marked as resolved."
+        if sent_to:
+            note += f" Receipt posted in {sent_to.mention}."
+        else:
+            note += " (No receipts channel set — ask an admin to run `/set_report_receipts_channel`.)"
+
+        await interaction.response.send_message(note, ephemeral=True)
+
+    @discord.ui.button(label="Add Other Trader (Staff)", style=discord.ButtonStyle.secondary, custom_id="report_add_other_trader")
+    async def add_other_trader(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Use `/report_add_user @user` in this report channel to add someone else to the channel.",
+            ephemeral=True
+        )
+
 # -------------------- Trade Views (Buttons) --------------------
 class PendingTradeView(discord.ui.View):
     def __init__(self):
@@ -587,6 +902,24 @@ class ActiveTradeView(discord.ui.View):
 
         update_trade(trade_id, partner_confirmed=1)
         await self._refresh_or_finalize(interaction, trade_id)
+
+    
+    @discord.ui.button(label="Report Scam / Sketchy", style=discord.ButtonStyle.danger, custom_id="trade_report_scam")
+    async def report_scam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID from message.", ephemeral=True)
+
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+        if trade["status"] != "active":
+            return await interaction.response.send_message("Reports can only be filed while the trade is **Active**.", ephemeral=True)
+
+        if interaction.user.id not in (int(trade["opener_id"]), int(trade["partner_id"])):
+            return await interaction.response.send_message("Only trade participants can file a report.", ephemeral=True)
+
+        await interaction.response.send_modal(ScamReportModal(trade_id))
 
     @discord.ui.button(label="Force Close (Staff)", style=discord.ButtonStyle.danger, custom_id="trade_force_close")
     async def force_close(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -673,6 +1006,13 @@ async def on_message(message: discord.Message):
 # -------------------- Commands --------------------
 def admin_only(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
+def is_staff_member(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
+        return True
+    role_ids = {r.id for r in getattr(member, "roles", [])}
+    return (MOD_ROLE_ID in role_ids) or (TRIAL_MOD_ROLE_ID in role_ids)
+
+
 
 @bot.event
 async def on_ready():
@@ -690,6 +1030,7 @@ async def on_ready():
 
     bot.add_view(PendingTradeView())
     bot.add_view(ActiveTradeView())
+    bot.add_view(ReportChannelView())
 
     if not expire_trades_loop.is_running():
         expire_trades_loop.start()
@@ -710,6 +1051,15 @@ async def set_vouch_channel(interaction: discord.Interaction, channel: discord.T
 
     set_config_value(interaction.guild.id, "vouch_channel_id", channel.id)
     await interaction.response.send_message(f"Vouch channel set to {channel.mention}.", ephemeral=True)
+@bot.tree.command(name="set_report_receipts_channel", description="Admin: set the channel where report receipts are posted")
+async def set_report_receipts_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not admin_only(interaction):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    set_config_value(interaction.guild.id, "report_receipts_channel_id", channel.id)
+    await interaction.response.send_message(f"Report receipts channel set to {channel.mention}.", ephemeral=True)
+
+
 
 @bot.tree.command(name="setup_roles", description="Admin: set the role IDs for New/Verified/Trusted tiers")
 async def setup_roles(interaction: discord.Interaction, new_role: discord.Role, verified_role: discord.Role, trusted_role: discord.Role):
@@ -848,6 +1198,25 @@ async def trade_history(interaction: discord.Interaction, user: discord.Member):
     )
     embed.set_footer(text="Shows last 5 trades (any status)")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+# ---- Report: add extra user (staff) ----
+@bot.tree.command(name="report_add_user", description="Staff: add another user to the current report channel")
+async def report_add_user(interaction: discord.Interaction, user: discord.Member):
+    if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+        return await interaction.response.send_message("Staff only.", ephemeral=True)
+
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("Use this inside a report text channel.", ephemeral=True)
+
+    report_id = _parse_report_id_from_channel(channel)
+    if not report_id:
+        return await interaction.response.send_message("This channel doesn't look like a report channel.", ephemeral=True)
+
+    overwrite = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+    await channel.set_permissions(user, overwrite=overwrite, reason=f"Added to report {report_id} by staff")
+    await interaction.response.send_message(f"✅ Added {user.mention} to this report channel.", ephemeral=True)
+
+
 
 # ---- Vouch (trade_id + stars REQUIRED) ----
 @bot.tree.command(name="vouch", description="Leave a vouch (requires completed Trade ID)")
