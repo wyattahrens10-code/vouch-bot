@@ -709,6 +709,11 @@ class ScamReportModal(discord.ui.Modal, title="Report Trade Issue"):
             overwrites=overwrites,
             reason=f"Scam report for {trade_id}"
         )
+# 🔧 Ensure reporter has access (fixes Railway/member cache issue)
+try:
+    await report_channel.set_permissions(interaction.user, read_messages=True, send_messages=True, attach_files=True, embed_links=True)
+except Exception as e:
+    logging.warning(f"Failed to set reporter permissions: {e}")
 
         # Build report embed
         accused_id = partner_id if reporter_id == opener_id else opener_id
@@ -1446,3 +1451,4 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
