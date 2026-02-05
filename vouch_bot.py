@@ -719,7 +719,7 @@ try:
         embed_links=True,
         read_message_history=True
     )
- except Exception as e:
+except Exception as e:
     logging.warning(f"Failed to set reporter permissions: {e}")
 
         # Build report embed
@@ -1458,6 +1458,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
