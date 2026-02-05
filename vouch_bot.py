@@ -723,7 +723,7 @@ except Exception as e:
     logging.warning(f"Failed to set reporter permissions: {e}")
 
         # Build report embed
-        accused_id = partner_id if reporter_id == opener_id else opener_id
+    accused_id = partner_id if reporter_id == opener_id else opener_id
         accused = guild.get_member(accused_id)
         accused_txt = accused.mention if accused else f"<@{accused_id}>"
 
@@ -1458,5 +1458,6 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
