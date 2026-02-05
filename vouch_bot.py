@@ -682,18 +682,44 @@ class ScamReportModal(discord.ui.Modal, title="Report Trade Issue"):
             n += 1
 
         # Overwrites
+        async def _get_member(uid: int) -> Optional[discord.Member]:
+            m = guild.get_member(uid)
+            if m:
+                return m
+            try:
+                return await guild.fetch_member(uid)
+            except Exception:
+                return None
+
+        me = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True),
         }
+        if me:
+            overwrites[me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True,
+                manage_messages=True,
+            )
 
-        reporter = guild.get_member(reporter_id)
-        opener = guild.get_member(opener_id)
-        partner = guild.get_member(partner_id)
+        # IMPORTANT: use fetch_member so the reporter/opener/partner always get included,
+        # even if they're not cached (no Members intent / cold start).
+        reporter = await _get_member(reporter_id) or interaction.user
+        opener = await _get_member(opener_id)
+        partner = await _get_member(partner_id)
 
         for m in [reporter, opener, partner]:
             if m:
-                overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+                overwrites[m] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True,
+                )
 
         mod_role = guild.get_role(MOD_ROLE_ID)
         trial_role = guild.get_role(TRIAL_MOD_ROLE_ID)
