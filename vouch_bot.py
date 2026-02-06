@@ -36,10 +36,11 @@ TRIAL_MOD_ROLE_ID = 1460828827206025329
 
 # Auto-VC system (join-to-create)
 CREATE_VC_TRIGGER_CHANNEL_ID = 1469166397492957234  # your ➕Create VC channel ID
-TEMP_VC_BASE_NAME = "Squad VC"  # created channels will be: Squad VC 1, Squad VC 2, ...
+TEMP_VC_PREFIX = "⫷┃𝚂𝚀𝚄𝙰𝙳 𝚅𝙲"
 
 
 intents = discord.Intents.default()
+intents.voice_states = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -147,10 +148,18 @@ def init_db():
         CREATE TABLE IF NOT EXISTS temp_vcs (
             guild_id INTEGER NOT NULL,
             channel_id INTEGER NOT NULL,
+            owner_id INTEGER,
             created_at INTEGER NOT NULL,
             PRIMARY KEY (guild_id, channel_id)
         )
         """)
+
+        # --- Safe migration: temp_vcs.owner_id ---
+        try:
+            con.execute("ALTER TABLE temp_vcs ADD COLUMN owner_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
 # --- Safe migrations for your existing DB ---
         try:
             con.execute("ALTER TABLE guild_config ADD COLUMN report_receipts_channel_id INTEGER")
@@ -263,12 +272,13 @@ def resolve_report(report_id: int, resolver_id: int):
 
 
 # -------------------- Temp VC helpers --------------------
-def add_temp_vc(guild_id: int, channel_id: int):
+
+def add_temp_vc(guild_id: int, channel_id: int, owner_id: int):
     now = int(time.time())
     with db() as con:
         con.execute(
-            "INSERT OR REPLACE INTO temp_vcs (guild_id, channel_id, created_at) VALUES (?,?,?)",
-            (guild_id, channel_id, now)
+            "INSERT OR REPLACE INTO temp_vcs (guild_id, channel_id, owner_id, created_at) VALUES (?,?,?,?)",
+            (guild_id, channel_id, owner_id, now)
         )
         con.commit()
 
@@ -285,48 +295,21 @@ def is_temp_vc(guild_id: int, channel_id: int) -> bool:
         ).fetchone()
         return row is not None
 
+def get_temp_vc_owner(guild_id: int, channel_id: int) -> Optional[int]:
+    with db() as con:
+        row = con.execute(
+            "SELECT owner_id FROM temp_vcs WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        ).fetchone()
+        return int(row["owner_id"]) if row and row["owner_id"] is not None else None
 
-# -------------------- Vouch DB helpers --------------------
-def add_vouch(guild_id: int, trade_id: str, target_id: int, voucher_id: int, stars: int,
-              note: Optional[str], proof_url: Optional[str]) -> None:
-    now = int(time.time())
+def set_temp_vc_owner(guild_id: int, channel_id: int, owner_id: int):
     with db() as con:
         con.execute(
-            "INSERT INTO vouches (guild_id, trade_id, target_id, voucher_id, stars, note, proof_url, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (guild_id, trade_id, target_id, voucher_id, stars, note, proof_url, now)
+            "UPDATE temp_vcs SET owner_id=? WHERE guild_id=? AND channel_id=?",
+            (owner_id, guild_id, channel_id)
         )
         con.commit()
-
-def vouch_count(guild_id: int, target_id: int) -> int:
-    with db() as con:
-        row = con.execute(
-            "SELECT COUNT(*) AS c FROM vouches WHERE guild_id = ? AND target_id = ? AND trade_id IS NOT NULL",
-            (guild_id, target_id)
-        ).fetchone()
-        return int(row["c"])
-
-def avg_stars(guild_id: int, target_id: int) -> float:
-    with db() as con:
-        row = con.execute(
-            "SELECT AVG(stars) AS a FROM vouches WHERE guild_id = ? AND target_id = ? AND trade_id IS NOT NULL",
-            (guild_id, target_id)
-        ).fetchone()
-        return float(row["a"] or 0.0)
-
-def top_traders(guild_id: int, limit: int = 10):
-    with db() as con:
-        rows = con.execute(
-            """
-            SELECT target_id, COUNT(*) AS vouches, AVG(stars) AS avg_stars
-            FROM vouches
-            WHERE guild_id = ? AND trade_id IS NOT NULL
-            GROUP BY target_id
-            ORDER BY vouches DESC, avg_stars DESC
-            LIMIT ?
-            """,
-            (guild_id, limit)
-        ).fetchall()
-        return [(int(r["target_id"]), int(r["vouches"]), float(r["avg_stars"] or 0.0)) for r in rows]
 
 # -------------------- Trade DB helpers --------------------
 def make_trade_id() -> str:
@@ -518,8 +501,9 @@ def user_badges(member: Optional[discord.Member]) -> dict:
 
 # -------------------- Auto-VC helpers --------------------
 def next_temp_vc_name(guild: discord.Guild) -> str:
-    """Find next available 'Squad VC N' name by scanning existing voice channels."""
-    pattern = re.compile(rf"^{re.escape(TEMP_VC_BASE_NAME)}\s+(\d+)$", re.IGNORECASE)
+    """Find next available '⫷┃𝚂𝚀𝚄𝙰𝙳 𝚅𝙲 N 🎙️' name by scanning existing voice channels."""
+    # Example: ⫷┃𝚂𝚀𝚄𝙰𝙳 𝚅𝙲 1 🎙️
+    pattern = re.compile(rf"^{re.escape(TEMP_VC_PREFIX)}\s+(\d+)\s+{re.escape(TEMP_VC_SUFFIX)}$", re.IGNORECASE)
     max_n = 0
     for ch in guild.voice_channels:
         m = pattern.match(ch.name or "")
@@ -528,8 +512,7 @@ def next_temp_vc_name(guild: discord.Guild) -> str:
                 max_n = max(max_n, int(m.group(1)))
             except Exception:
                 pass
-    return f"{TEMP_VC_BASE_NAME} {max_n + 1}"
-
+    return f"{TEMP_VC_PREFIX} {max_n + 1} {TEMP_VC_SUFFIX}"
 # -------------------- Embeds --------------------
 def build_trade_embed(guild: discord.Guild, trade_id: str) -> discord.Embed:
     trade = get_trade(trade_id)
@@ -1087,8 +1070,13 @@ async def on_message(message: discord.Message):
 # -------------------- Auto-VC (join-to-create) --------------------
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # User joined the trigger channel -> create a temp VC and move them
+    """Auto VC:
+    - Join trigger channel -> create VC + move user, store owner_id
+    - If VC becomes empty -> delete + remove DB row
+    - If owner leaves but VC still has members -> transfer ownership to a remaining member (random)
+    """
     try:
+        # User joined the trigger channel -> create a temp VC and move them
         if after and after.channel and after.channel.id == CREATE_VC_TRIGGER_CHANNEL_ID:
             guild = member.guild
             trigger_ch = after.channel
@@ -1102,8 +1090,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 reason=f"Auto-VC created for {member} ({member.id})"
             )
 
-            # Track in DB so we know which ones are safe to auto-delete
-            add_temp_vc(guild.id, new_vc.id)
+            # Track in DB so we know which ones are safe to auto-delete + who the owner is
+            add_temp_vc(guild.id, new_vc.id, member.id)
 
             # Move creator into the new VC
             await member.move_to(new_vc, reason="Moved to auto-created VC")
@@ -1111,12 +1099,28 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         # User left a channel -> delete it if it's an empty temp VC
         if before and before.channel and (after is None or after.channel != before.channel):
             ch = before.channel
-            if ch and isinstance(ch, discord.VoiceChannel):
-                if is_temp_vc(member.guild.id, ch.id) and len(ch.members) == 0:
+            if ch and isinstance(ch, discord.VoiceChannel) and is_temp_vc(member.guild.id, ch.id):
+                # If owner left but others remain -> transfer ownership
+                owner_id = get_temp_vc_owner(member.guild.id, ch.id)
+                if owner_id == member.id and len(ch.members) > 0:
+                    import random as _random
+                    new_owner = _random.choice(list(ch.members))
+                    set_temp_vc_owner(member.guild.id, ch.id, new_owner.id)
+                    try:
+                        await new_owner.send(
+                            f"🎙️ You are now the VC owner for **{ch.name}** in **{member.guild.name}**. "
+                            f"Use `/vc_limit` to set the max members."
+                        )
+                    except Exception:
+                        pass
+
+                # If nobody left -> cleanup
+                if len(ch.members) == 0:
                     try:
                         await ch.delete(reason="Auto-VC cleanup (empty)")
                     finally:
                         remove_temp_vc(member.guild.id, ch.id)
+
     except Exception as e:
         logging.warning(f"Auto-VC error: {e}")
 
@@ -1532,6 +1536,32 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
 
     embed.set_footer(text="Public stats • Based on tracked trade tickets")
     await interaction.response.send_message(embed=embed, ephemeral=False)
+
+@bot.tree.command(name="vc_limit", description="VC owner: set max members for your Auto VC (0 = unlimited)")
+@app_commands.describe(limit="Max members allowed in your Auto VC (0 = unlimited)")
+async def vc_limit(interaction: discord.Interaction, limit: app_commands.Range[int, 0, 99]):
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        return await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+
+    voice = getattr(interaction.user, "voice", None)
+    if not voice or not voice.channel or not isinstance(voice.channel, discord.VoiceChannel):
+        return await interaction.response.send_message("Join your Auto VC first, then run this.", ephemeral=True)
+
+    ch = voice.channel
+    if not is_temp_vc(interaction.guild.id, ch.id):
+        return await interaction.response.send_message("This command only works inside an Auto VC.", ephemeral=True)
+
+    owner_id = get_temp_vc_owner(interaction.guild.id, ch.id)
+    if owner_id != interaction.user.id and not is_staff_member(interaction.user):
+        return await interaction.response.send_message("Only the VC owner (or staff) can change the limit.", ephemeral=True)
+
+    try:
+        await ch.edit(user_limit=int(limit), reason=f"Auto-VC limit set by {interaction.user} ({interaction.user.id})")
+    except Exception as e:
+        return await interaction.response.send_message(f"Couldn't update that VC: {e}", ephemeral=True)
+
+    txt = "Unlimited" if int(limit) == 0 else str(int(limit))
+    await interaction.response.send_message(f"✅ **{ch.name}** max members set to **{txt}**.", ephemeral=True)
 
 @bot.tree.command(name="toptraders", description="Show top traders (public)")
 async def toptraders_cmd(interaction: discord.Interaction):
