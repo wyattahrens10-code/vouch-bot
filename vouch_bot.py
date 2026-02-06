@@ -1016,49 +1016,95 @@ class ActiveTradeView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Confirm Complete (Opener)", style=discord.ButtonStyle.primary, custom_id="trade_confirm_opener")
+    @discord.ui.button(
+        label="Confirm Complete (Opener)",
+        style=discord.ButtonStyle.primary,
+        custom_id="trade_confirm_opener"
+    )
     async def confirm_opener(self, interaction: discord.Interaction, button: discord.ui.Button):
         trade_id = trade_id_from_message(interaction)
         if not trade_id:
             return await interaction.response.send_message("Couldn't read Trade ID.", ephemeral=True)
+
         trade = get_trade(trade_id)
         if not trade or trade["status"] != "active":
             return await interaction.response.send_message("Trade not active.", ephemeral=True)
+
         if interaction.user.id != int(trade["opener_id"]):
             return await interaction.response.send_message("Only opener can confirm.", ephemeral=True)
+
         update_trade(trade_id, opener_confirmed=1)
         await self._refresh_or_finalize(interaction, trade_id)
 
-    @discord.ui.button(label="Confirm Complete (Partner)", style=discord.ButtonStyle.primary, custom_id="trade_confirm_partner")
+    @discord.ui.button(
+        label="Confirm Complete (Partner)",
+        style=discord.ButtonStyle.primary,
+        custom_id="trade_confirm_partner"
+    )
     async def confirm_partner(self, interaction: discord.Interaction, button: discord.ui.Button):
         trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID.", ephemeral=True)
+
         trade = get_trade(trade_id)
+        if not trade or trade["status"] != "active":
+            return await interaction.response.send_message("Trade not active.", ephemeral=True)
+
         if interaction.user.id != int(trade["partner_id"]):
             return await interaction.response.send_message("Only partner can confirm.", ephemeral=True)
+
         update_trade(trade_id, partner_confirmed=1)
         await self._refresh_or_finalize(interaction, trade_id)
 
-    @discord.ui.button(label="🚨 Report Issue", style=discord.ButtonStyle.danger, custom_id="trade_report_button")
+    @discord.ui.button(
+        label="🚨 Report Issue",
+        style=discord.ButtonStyle.danger,
+        custom_id="trade_report_button"
+    )
     async def report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID.", ephemeral=True)
+
         trade = get_trade(trade_id)
         if not trade or trade["status"] != "active":
-            return await interaction.response.send_message("Reports only allowed during active trades.", ephemeral=True)
+            return await interaction.response.send_message(
+                "Reports only allowed during active trades.",
+                ephemeral=True
+            )
+
         await interaction.response.send_modal(ScamReportModal(trade_id))
 
-    @discord.ui.button(label="Force Close (Staff)", style=discord.ButtonStyle.danger, custom_id="trade_force_close")
+    @discord.ui.button(
+        label="Force Close (Staff)",
+        style=discord.ButtonStyle.danger,
+        custom_id="trade_force_close"
+    )
     async def force_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("Staff only.", ephemeral=True)
+
         trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID.", ephemeral=True)
+
         update_trade(trade_id, status="cancelled")
         embed = build_trade_embed(interaction.guild, trade_id)
         await interaction.response.edit_message(embed=embed, view=None)
 
-# Register persistent view
-@bot.event
-async def on_ready():
-    bot.add_view(ActiveTradeView())
+    async def _refresh_or_finalize(self, interaction: discord.Interaction, trade_id: str):
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+
+        if int(trade["opener_confirmed"]) == 1 and int(trade["partner_confirmed"]) == 1:
+            update_trade(trade_id, status="completed")
+            embed = build_trade_embed(interaction.guild, trade_id)
+            await interaction.response.edit_message(embed=embed, view=None)
+        else:
+            embed = build_trade_embed(interaction.guild, trade_id)
+            await interaction.response.edit_message(embed=embed, view=self)
+
 # -------------------- Auto-expire task --------------------
 @tasks.loop(minutes=1)
 async def expire_trades_loop():
@@ -1196,7 +1242,6 @@ async def on_ready():
     bot.add_view(PendingTradeView())
     bot.add_view(ActiveTradeView())
     bot.add_view(ReportChannelView())
-    bot.add_view(CompletedTradeView())
 
     if not expire_trades_loop.is_running():
         expire_trades_loop.start()
@@ -1638,5 +1683,6 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
