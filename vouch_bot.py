@@ -67,7 +67,7 @@ def init_db():
         con.execute("""
         CREATE TABLE IF NOT EXISTS guild_config (
             guild_id INTEGER PRIMARY KEY,
-            vouch_channel_id INTEGER,
+            _channel_id INTEGER,
             trade_channel_id INTEGER,
             report_receipts_channel_id INTEGER,
             role_new_id INTEGER,
@@ -270,6 +270,50 @@ def resolve_report(report_id: int, resolver_id: int):
         )
         con.commit()
 
+# -------------------- Vouch DB helpers --------------------
+def add_vouch(guild_id: int, trade_id: str, target_id: int, voucher_id: int, stars: int,
+              note: Optional[str], proof_url: Optional[str]) -> None:
+    now = int(time.time())
+    with db() as con:
+        con.execute(
+            "INSERT INTO vouches (guild_id, trade_id, target_id, voucher_id, stars, note, proof_url, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (guild_id, trade_id, target_id, voucher_id, stars, note, proof_url, now)
+        )
+        con.commit()
+
+
+def vouch_count(guild_id: int, target_id: int) -> int:
+    with db() as con:
+        row = con.execute(
+            "SELECT COUNT(*) AS c FROM vouches WHERE guild_id = ? AND target_id = ? AND trade_id IS NOT NULL",
+            (guild_id, target_id)
+        ).fetchone()
+        return int(row["c"])
+
+
+def avg_stars(guild_id: int, target_id: int) -> float:
+    with db() as con:
+        row = con.execute(
+            "SELECT AVG(stars) AS a FROM vouches WHERE guild_id = ? AND target_id = ? AND trade_id IS NOT NULL",
+            (guild_id, target_id)
+        ).fetchone()
+        return float(row["a"] or 0.0)
+
+
+def top_traders(guild_id: int, limit: int = 10):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT target_id, COUNT(*) AS vouches, AVG(stars) AS avg_stars
+            FROM vouches
+            WHERE guild_id = ? AND trade_id IS NOT NULL
+            GROUP BY target_id
+            ORDER BY vouches DESC, avg_stars DESC
+            LIMIT ?
+            """,
+            (guild_id, limit)
+        ).fetchall()
+        return [(int(r["target_id"]), int(r["vouches"]), float(r["avg_stars"] or 0.0)) for r in rows]
 
 # -------------------- Temp VC helpers --------------------
 
@@ -1593,5 +1637,6 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
