@@ -1190,7 +1190,7 @@ class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
         total = vouch_count(interaction.guild.id, target_id)
         avg = avg_stars(interaction.guild.id, target_id)
 
-                target_member = interaction.guild.get_member(target_id)
+        target_member = interaction.guild.get_member(target_id)
         tier_update = None
         if target_member:
             tier_update = await apply_roles(target_member, total)
@@ -1212,24 +1212,6 @@ class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
             note=note,
             proof_url=proof_url
         )
-
-            trader_member = interaction.guild.get_member(target_id)
-if trader_member is None:
-    trader_member = await interaction.guild.fetch_member(target_id)
-
-embed = build_vouch_embed(
-    interaction.guild,
-    trade_id,
-    trader=trader_member,
-    voucher=interaction.user,
-    stars=stars,
-    total=total,
-    avg=avg,
-    tier_update=tier_update,
-    note=note,
-    proof_url=proof_url
-)
-
 
         await interaction.response.send_message(f"✅ Vouch logged! Posted in {vouch_channel.mention}.", ephemeral=True)
         await vouch_channel.send(embed=embed)
