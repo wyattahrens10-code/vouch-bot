@@ -972,7 +972,45 @@ class PendingTradeView(discord.ui.View):
         update_trade(trade_id, status="active", accepted=1)
         embed = build_trade_embed(interaction.guild, trade_id)
         await interaction.response.edit_message(embed=embed, view=ActiveTradeView())
-class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="trade_decline")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID from message.", ephemeral=True)
+
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+        if trade["status"] != "pending":
+            return await interaction.response.send_message("This trade is no longer pending.", ephemeral=True)
+
+        if interaction.user.id != int(trade["partner_id"]):
+            return await interaction.response.send_message("Only the tagged partner can decline.", ephemeral=True)
+
+        update_trade(trade_id, status="declined")
+        embed = build_trade_embed(interaction.guild, trade_id)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="Cancel Request", style=discord.ButtonStyle.secondary, custom_id="trade_cancel")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID from message.", ephemeral=True)
+
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+        if trade["status"] != "pending":
+            return await interaction.response.send_message("This trade is no longer pending.", ephemeral=True)
+
+        if interaction.user.id != int(trade["opener_id"]):
+            return await interaction.response.send_message("Only the opener can cancel this request.", ephemeral=True)
+
+        update_trade(trade_id, status="cancelled")
+        embed = build_trade_embed(interaction.guild, trade_id)
+        await interaction.response.edit_message(embed=embed, view=None)
+
     def __init__(self, trade_id: str):
         super().__init__(timeout=None)
         self.trade_id = trade_id
@@ -1798,6 +1836,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
