@@ -1190,14 +1190,15 @@ class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
         total = vouch_count(interaction.guild.id, target_id)
         avg = avg_stars(interaction.guild.id, target_id)
 
-        target_member = interaction.guild.get_member(target_id)
+                target_member = interaction.guild.get_member(target_id)
         tier_update = None
         if target_member:
             tier_update = await apply_roles(target_member, total)
 
+        # Always show the OTHER trader as "Trader" on the vouch embed
         trader_member = interaction.guild.get_member(target_id)
         if trader_member is None:
-    trader_member = await interaction.guild.fetch_member(target_id)
+            trader_member = await interaction.guild.fetch_member(target_id)
 
         embed = build_vouch_embed(
             interaction.guild,
@@ -1210,6 +1211,7 @@ class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
             tier_update=tier_update,
             note=note,
             proof_url=proof_url
+        )
 
             trader_member = interaction.guild.get_member(target_id)
 if trader_member is None:
@@ -1833,6 +1835,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
