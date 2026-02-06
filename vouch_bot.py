@@ -40,8 +40,7 @@ TEMP_VC_PREFIX = "⫷┃𝚂𝚀𝚄𝙰𝙳 𝚅𝙲"
 
 
 intents = discord.Intents.default()
-intents.voice_states = True
-intents.voice_states = True
+intents.voice_states = True  # ✅ REQUIRED for AutoVC
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.tree.error
@@ -1593,3 +1592,4 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
