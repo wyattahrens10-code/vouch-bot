@@ -1100,10 +1100,31 @@ class ActiveTradeView(discord.ui.View):
         if int(trade["opener_confirmed"]) == 1 and int(trade["partner_confirmed"]) == 1:
             update_trade(trade_id, status="completed")
             embed = build_trade_embed(interaction.guild, trade_id)
-            await interaction.response.edit_message(embed=embed, view=None)
+            await interaction.response.edit_message(embed=embed, view=CompletedTradeView())
         else:
             embed = build_trade_embed(interaction.guild, trade_id)
             await interaction.response.edit_message(embed=embed, view=self)
+        
+class CompletedTradeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ Leave Vouch", style=discord.ButtonStyle.success, custom_id="trade_leave_vouch")
+    async def leave_vouch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID.", ephemeral=True)
+
+        trade = get_trade(trade_id)
+        if not trade or trade["status"] != "completed":
+            return await interaction.response.send_message("This trade is not completed.", ephemeral=True)
+
+        # Only participants can vouch
+        if interaction.user.id not in (int(trade["opener_id"]), int(trade["partner_id"])):
+            return await interaction.response.send_message("Only trade participants can vouch.", ephemeral=True)
+
+        await interaction.response.send_modal(VouchFromTradeModal(trade_id))
+
 
 # -------------------- Auto-expire task --------------------
 @tasks.loop(minutes=1)
@@ -1242,6 +1263,7 @@ async def on_ready():
     bot.add_view(PendingTradeView())
     bot.add_view(ActiveTradeView())
     bot.add_view(ReportChannelView())
+    bot.add_view(CompletedTradeView())
 
     if not expire_trades_loop.is_running():
         expire_trades_loop.start()
@@ -1683,6 +1705,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
