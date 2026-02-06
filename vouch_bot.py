@@ -588,7 +588,7 @@ def build_trade_embed(guild: discord.Guild, trade_id: str) -> discord.Embed:
 
     if status == "pending":
         embed.add_field(name="Status", value="Waiting for partner to accept or decline.", inline=False)
-        embed.set_footer(text="Partner: click Accept/Decline • Auto-expires in 3 hours")
+        embed.set_footer(text="Only opener/partner can confirm • RECORD/CLIP NOW (clip proof is needed for staff action if somthing happens) • Auto-expires in 3 hours")
     elif status == "active":
         embed.add_field(name="Status", value="Active — complete the trade then both confirm.", inline=False)
         embed.add_field(
@@ -700,11 +700,11 @@ class ScamReportModal(discord.ui.Modal, title="Report Trade Issue"):
             placeholder="What items/GOOP were supposed to be traded?"
         )
         self.proof_url = discord.ui.TextInput(
-            label="Proof link (clip recommended)",
+            label="Proof (link) — or upload in the report channel"
             style=discord.TextStyle.short,
             required=False,
             max_length=200,
-            placeholder="Paste a clip/link if you have it (strongly recommended)."
+            placeholder="Paste a link, or submit without it and upload the clip in the report channel."
         )
 
         self.add_item(self.what_happened)
@@ -834,9 +834,9 @@ class ScamReportModal(discord.ui.Modal, title="Report Trade Issue"):
         if proof:
             embed.add_field(name="Proof", value=proof[:1024], inline=False)
         else:
-            embed.add_field(name="Proof", value="*Not provided yet — clip is strongly recommended.*", inline=False)
-
-        embed.set_footer(text="Mods: use Mark Resolved when handled • You can add another trader if needed")
+            embed.add_field(name="Proof", value="*Not provided yet — CLIP PROOF is needed for mods to take action.*", inline=False)
+            
+            embed.set_footer(text="Mods: use Mark Resolved when handled • You can add another trader if needed")
 
         view = ReportChannelView()
 
@@ -868,6 +868,26 @@ class ReportChannelView(discord.ui.View):
     async def mark_resolved(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
+            
+    @discord.ui.button(label="Delete Channel (No Receipt)", style=discord.ButtonStyle.secondary, custom_id="report_delete_no_receipt")
+    async def delete_no_receipt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("This must be used in a report channel.", ephemeral=True)
+
+        report_id = _parse_report_id_from_channel(channel)
+        if not report_id:
+            return await interaction.response.send_message("Couldn't find Report ID for this channel.", ephemeral=True)
+
+        await interaction.response.send_message("🗑️ Deleting this report channel (no receipt will be posted).", ephemeral=True)
+
+        try:
+            await channel.delete(reason=f"Report {report_id} deleted w/o receipt by {interaction.user.id}")
+        except Exception as e:
+            logging.warning(f"Failed to delete report channel {channel.id}: {e}")
 
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel):
@@ -952,6 +972,128 @@ class PendingTradeView(discord.ui.View):
         update_trade(trade_id, status="active", accepted=1)
         embed = build_trade_embed(interaction.guild, trade_id)
         await interaction.response.edit_message(embed=embed, view=ActiveTradeView())
+class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
+    def __init__(self, trade_id: str):
+        super().__init__(timeout=None)
+        self.trade_id = trade_id
+
+        self.stars = discord.ui.TextInput(
+            label="Stars (1-5)",
+            required=True,
+            max_length=1,
+            placeholder="Example: 5"
+        )
+        self.note = discord.ui.TextInput(
+            label="Note (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            placeholder="Quick summary of how the trade went."
+        )
+        self.proof_url = discord.ui.TextInput(
+            label="Proof link (optional)",
+            required=False,
+            max_length=200,
+            placeholder="Clip/link (recommended)"
+        )
+
+        self.add_item(self.stars)
+        self.add_item(self.note)
+        self.add_item(self.proof_url)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        trade_id = self.trade_id.strip().upper()
+        trade_row = get_trade(trade_id)
+        if not trade_row:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+
+        if int(trade_row["guild_id"]) != interaction.guild.id:
+            return await interaction.response.send_message("That Trade ID is not for this server.", ephemeral=True)
+
+        if trade_row["status"] != "completed":
+            return await interaction.response.send_message("That trade is not completed.", ephemeral=True)
+
+        opener_id = int(trade_row["opener_id"])
+        partner_id = int(trade_row["partner_id"])
+        voucher_id = interaction.user.id
+
+        if voucher_id not in (opener_id, partner_id):
+            return await interaction.response.send_message("Only trade participants can vouch for this trade.", ephemeral=True)
+
+        target_id = partner_id if voucher_id == opener_id else opener_id
+
+        # parse stars
+        try:
+            stars = int(str(self.stars.value).strip())
+        except ValueError:
+            return await interaction.response.send_message("Stars must be a number 1-5.", ephemeral=True)
+
+        if stars < 1 or stars > 5:
+            return await interaction.response.send_message("Stars must be between 1 and 5.", ephemeral=True)
+
+        note = str(self.note.value).strip() if self.note.value else None
+        proof_url = str(self.proof_url.value).strip() if self.proof_url.value else None
+
+        cfg = get_config(interaction.guild.id)
+        vouch_channel_id = int(cfg["vouch_channel_id"] or 0)
+        if not vouch_channel_id:
+            return await interaction.response.send_message("Vouch channel isn’t set yet. Admins: use `/set_vouch_channel`.", ephemeral=True)
+
+        vouch_channel = interaction.guild.get_channel(vouch_channel_id)
+        if not isinstance(vouch_channel, discord.TextChannel):
+            return await interaction.response.send_message("Vouch channel is invalid. Admins: run `/set_vouch_channel` again.", ephemeral=True)
+
+        try:
+            add_vouch(interaction.guild.id, trade_id, target_id, voucher_id, stars, note, proof_url)
+        except sqlite3.IntegrityError:
+            return await interaction.response.send_message("You already vouched for this trade.", ephemeral=True)
+
+        total = vouch_count(interaction.guild.id, target_id)
+        avg = avg_stars(interaction.guild.id, target_id)
+
+        target_member = interaction.guild.get_member(target_id)
+        tier_update = None
+        if target_member:
+            tier_update = await apply_roles(target_member, total)
+
+        embed = build_vouch_embed(
+            interaction.guild,
+            trade_id,
+            trader=target_member or discord.Object(id=target_id),  # fallback
+            voucher=interaction.user,
+            stars=stars,
+            total=total,
+            avg=avg,
+            tier_update=tier_update,
+            note=note,
+            proof_url=proof_url
+        )
+
+        await interaction.response.send_message(f"✅ Vouch logged! Posted in {vouch_channel.mention}.", ephemeral=True)
+        await vouch_channel.send(embed=embed)
+
+
+class CompletedTradeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Leave Vouch", style=discord.ButtonStyle.success, custom_id="trade_leave_vouch")
+    async def leave_vouch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID from message.", ephemeral=True)
+
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+
+        if trade["status"] != "completed":
+            return await interaction.response.send_message("This trade is not completed.", ephemeral=True)
+
+        if interaction.user.id not in (int(trade["opener_id"]), int(trade["partner_id"])):
+            return await interaction.response.send_message("Only trade participants can vouch for this trade.", ephemeral=True)
+
+        await interaction.response.send_modal(VouchFromTradeModal(trade_id))
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="trade_decline")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -969,6 +1111,24 @@ class PendingTradeView(discord.ui.View):
             return await interaction.response.send_message("Only the tagged partner can decline.", ephemeral=True)
 
         update_trade(trade_id, status="declined")
+        embed = build_trade_embed(interaction.guild, trade_id)
+        await interaction.response.edit_message(embed=embed, view=CompletedTradeView())
+    @discord.ui.button(label="Cancel Request", style=discord.ButtonStyle.secondary, custom_id="trade_cancel")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        trade_id = trade_id_from_message(interaction)
+        if not trade_id:
+            return await interaction.response.send_message("Couldn't read Trade ID from message.", ephemeral=True)
+
+        trade = get_trade(trade_id)
+        if not trade:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+        if trade["status"] != "pending":
+            return await interaction.response.send_message("This trade is no longer pending.", ephemeral=True)
+
+        if interaction.user.id != int(trade["opener_id"]):
+            return await interaction.response.send_message("Only the trade opener can cancel this request.", ephemeral=True)
+
+        update_trade(trade_id, status="cancelled")
         embed = build_trade_embed(interaction.guild, trade_id)
         await interaction.response.edit_message(embed=embed, view=None)
 
@@ -1044,7 +1204,7 @@ class ActiveTradeView(discord.ui.View):
         update_trade(trade_id, status="cancelled")
         embed = build_trade_embed(interaction.guild, trade_id)
         embed.add_field(name="Staff Action", value=f"Force closed by {interaction.user.mention}", inline=False)
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.response.edit_message(embed=embed, view=CompletedTradeView())
 
     async def _refresh_or_finalize(self, interaction: discord.Interaction, trade_id: str):
         trade = get_trade(trade_id)
@@ -1196,6 +1356,7 @@ async def on_ready():
     bot.add_view(PendingTradeView())
     bot.add_view(ActiveTradeView())
     bot.add_view(ReportChannelView())
+    bot.add_view(CompletedTradeView())
 
     if not expire_trades_loop.is_running():
         expire_trades_loop.start()
@@ -1637,6 +1798,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
