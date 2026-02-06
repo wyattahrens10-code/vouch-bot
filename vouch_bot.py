@@ -700,7 +700,7 @@ class ScamReportModal(discord.ui.Modal, title="Report Trade Issue"):
             placeholder="What items/GOOP were supposed to be traded?"
         )
         self.proof_url = discord.ui.TextInput(
-            label="Proof (link) — or upload in the report channel"
+            label="Proof (link) — or upload in the report channel",
             style=discord.TextStyle.short,
             required=False,
             max_length=200,
@@ -1798,6 +1798,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
