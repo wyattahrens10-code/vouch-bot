@@ -34,9 +34,10 @@ REPORT_CATEGORY_ID = 1460823073765720260  # Trading Hub category
 MOD_ROLE_ID = 1460828375613706403
 TRIAL_MOD_ROLE_ID = 1460828827206025329
 
-# Auto-VC system (join-to-create)
+# Auto- system (join-to-create)
 CREATE_VC_TRIGGER_CHANNEL_ID = 1469166397492957234  # your ➕Create VC channel ID
 TEMP_VC_PREFIX = "⫷┃𝚂𝚀𝚄𝙰𝙳 𝚅𝙲"
+TEMP_VC_SUFFIX = "🎙️"
 
 
 intents = discord.Intents.default()
@@ -1592,4 +1593,5 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
