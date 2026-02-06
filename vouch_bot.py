@@ -1196,7 +1196,7 @@ class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
             tier_update = await apply_roles(target_member, total)
 
         trader_member = interaction.guild.get_member(target_id)
-if trader_member is None:
+        if trader_member is None:
     trader_member = await interaction.guild.fetch_member(target_id)
 
         embed = build_vouch_embed(
@@ -1833,6 +1833,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
