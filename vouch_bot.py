@@ -1104,6 +1104,113 @@ class ActiveTradeView(discord.ui.View):
         else:
             embed = build_trade_embed(interaction.guild, trade_id)
             await interaction.response.edit_message(embed=embed, view=self)
+
+class VouchFromTradeModal(discord.ui.Modal, title="Leave a Vouch"):
+    def __init__(self, trade_id: str):
+        super().__init__(timeout=None)
+        self.trade_id = trade_id
+
+        self.stars = discord.ui.TextInput(
+            label="Stars (1-5)",
+            required=True,
+            max_length=1,
+            placeholder="Example: 5"
+        )
+        self.note = discord.ui.TextInput(
+            label="Note (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            placeholder="Quick summary of how the trade went."
+        )
+        self.proof_url = discord.ui.TextInput(
+            label="Proof link (optional)",
+            required=False,
+            max_length=200,
+            placeholder="Clip/link (recommended)"
+        )
+
+        self.add_item(self.stars)
+        self.add_item(self.note)
+        self.add_item(self.proof_url)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        trade_id = self.trade_id.strip().upper()
+        trade_row = get_trade(trade_id)
+        if not trade_row:
+            return await interaction.response.send_message("Trade not found.", ephemeral=True)
+
+        if int(trade_row["guild_id"]) != interaction.guild.id:
+            return await interaction.response.send_message("That Trade ID is not for this server.", ephemeral=True)
+
+        if trade_row["status"] != "completed":
+            return await interaction.response.send_message("That trade is not completed.", ephemeral=True)
+
+        opener_id = int(trade_row["opener_id"])
+        partner_id = int(trade_row["partner_id"])
+        voucher_id = interaction.user.id
+
+        if voucher_id not in (opener_id, partner_id):
+            return await interaction.response.send_message("Only trade participants can vouch for this trade.", ephemeral=True)
+
+        target_id = partner_id if voucher_id == opener_id else opener_id
+
+        # parse stars
+        try:
+            stars = int(str(self.stars.value).strip())
+        except ValueError:
+            return await interaction.response.send_message("Stars must be a number 1-5.", ephemeral=True)
+
+        if stars < 1 or stars > 5:
+            return await interaction.response.send_message("Stars must be between 1 and 5.", ephemeral=True)
+
+        note = str(self.note.value).strip() if self.note.value else None
+        proof_url = str(self.proof_url.value).strip() if self.proof_url.value else None
+
+        cfg = get_config(interaction.guild.id)
+        vouch_channel_id = int(cfg["vouch_channel_id"] or 0)
+        if not vouch_channel_id:
+            return await interaction.response.send_message(
+                "Vouch channel isn’t set yet. Admins: use `/set_vouch_channel`.",
+                ephemeral=True
+            )
+
+        vouch_channel = interaction.guild.get_channel(vouch_channel_id)
+        if not isinstance(vouch_channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "Vouch channel is invalid. Admins: run `/set_vouch_channel` again.",
+                ephemeral=True
+            )
+
+        try:
+            add_vouch(interaction.guild.id, trade_id, target_id, voucher_id, stars, note, proof_url)
+        except sqlite3.IntegrityError:
+            return await interaction.response.send_message("You already vouched for this trade.", ephemeral=True)
+
+        total = vouch_count(interaction.guild.id, target_id)
+        avg = avg_stars(interaction.guild.id, target_id)
+
+        target_member = interaction.guild.get_member(target_id)
+        tier_update = None
+        if target_member:
+            tier_update = await apply_roles(target_member, total)
+
+        embed = build_vouch_embed(
+            interaction.guild,
+            trade_id,
+            trader=target_member or interaction.guild.get_member(target_id) or interaction.user,
+            voucher=interaction.user,
+            stars=stars,
+            total=total,
+            avg=avg,
+            tier_update=tier_update,
+            note=note,
+            proof_url=proof_url
+        )
+
+        await interaction.response.send_message(f"✅ Vouch logged! Posted in {vouch_channel.mention}.", ephemeral=True)
+        await vouch_channel.send(embed=embed)
+
         
 class CompletedTradeView(discord.ui.View):
     def __init__(self):
@@ -1705,6 +1812,7 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
 
 
 
