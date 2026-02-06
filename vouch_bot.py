@@ -34,7 +34,13 @@ REPORT_CATEGORY_ID = 1460823073765720260  # Trading Hub category
 MOD_ROLE_ID = 1460828375613706403
 TRIAL_MOD_ROLE_ID = 1460828827206025329
 
+# Auto-VC system (join-to-create)
+CREATE_VC_TRIGGER_CHANNEL_ID = 1469166397492957234  # your ➕Create VC channel ID
+TEMP_VC_BASE_NAME = "Squad VC"  # created channels will be: Squad VC 1, Squad VC 2, ...
+
+
 intents = discord.Intents.default()
+intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.tree.error
@@ -135,7 +141,17 @@ def init_db():
         """)
 
 
-        # --- Safe migrations for your existing DB ---
+        
+        # Temporary voice channels created by the bot
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS temp_vcs (
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, channel_id)
+        )
+        """)
+# --- Safe migrations for your existing DB ---
         try:
             con.execute("ALTER TABLE guild_config ADD COLUMN report_receipts_channel_id INTEGER")
         except sqlite3.OperationalError:
@@ -245,6 +261,29 @@ def resolve_report(report_id: int, resolver_id: int):
         )
         con.commit()
 
+
+# -------------------- Temp VC helpers --------------------
+def add_temp_vc(guild_id: int, channel_id: int):
+    now = int(time.time())
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO temp_vcs (guild_id, channel_id, created_at) VALUES (?,?,?)",
+            (guild_id, channel_id, now)
+        )
+        con.commit()
+
+def remove_temp_vc(guild_id: int, channel_id: int):
+    with db() as con:
+        con.execute("DELETE FROM temp_vcs WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+        con.commit()
+
+def is_temp_vc(guild_id: int, channel_id: int) -> bool:
+    with db() as con:
+        row = con.execute(
+            "SELECT 1 FROM temp_vcs WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        ).fetchone()
+        return row is not None
 
 
 # -------------------- Vouch DB helpers --------------------
@@ -475,6 +514,21 @@ def user_badges(member: Optional[discord.Member]) -> dict:
     staff = pick_single_role_name(member, STAFF_ROLE_NAMES)
 
     return {"region": region, "platform": platform, "playstyle": playstyle, "staff": staff}
+
+
+# -------------------- Auto-VC helpers --------------------
+def next_temp_vc_name(guild: discord.Guild) -> str:
+    """Find next available 'Squad VC N' name by scanning existing voice channels."""
+    pattern = re.compile(rf"^{re.escape(TEMP_VC_BASE_NAME)}\s+(\d+)$", re.IGNORECASE)
+    max_n = 0
+    for ch in guild.voice_channels:
+        m = pattern.match(ch.name or "")
+        if m:
+            try:
+                max_n = max(max_n, int(m.group(1)))
+            except Exception:
+                pass
+    return f"{TEMP_VC_BASE_NAME} {max_n + 1}"
 
 # -------------------- Embeds --------------------
 def build_trade_embed(guild: discord.Guild, trade_id: str) -> discord.Embed:
@@ -1028,6 +1082,43 @@ async def on_message(message: discord.Message):
             )
 
     await bot.process_commands(message)
+
+
+# -------------------- Auto-VC (join-to-create) --------------------
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # User joined the trigger channel -> create a temp VC and move them
+    try:
+        if after and after.channel and after.channel.id == CREATE_VC_TRIGGER_CHANNEL_ID:
+            guild = member.guild
+            trigger_ch = after.channel
+            category = trigger_ch.category  # keep everything under the same category as the trigger channel
+
+            # Create the new VC
+            new_name = next_temp_vc_name(guild)
+            new_vc = await guild.create_voice_channel(
+                name=new_name,
+                category=category,
+                reason=f"Auto-VC created for {member} ({member.id})"
+            )
+
+            # Track in DB so we know which ones are safe to auto-delete
+            add_temp_vc(guild.id, new_vc.id)
+
+            # Move creator into the new VC
+            await member.move_to(new_vc, reason="Moved to auto-created VC")
+
+        # User left a channel -> delete it if it's an empty temp VC
+        if before and before.channel and (after is None or after.channel != before.channel):
+            ch = before.channel
+            if ch and isinstance(ch, discord.VoiceChannel):
+                if is_temp_vc(member.guild.id, ch.id) and len(ch.members) == 0:
+                    try:
+                        await ch.delete(reason="Auto-VC cleanup (empty)")
+                    finally:
+                        remove_temp_vc(member.guild.id, ch.id)
+    except Exception as e:
+        logging.warning(f"Auto-VC error: {e}")
 
 # -------------------- Commands --------------------
 def admin_only(interaction: discord.Interaction) -> bool:
