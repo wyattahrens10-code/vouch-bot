@@ -860,16 +860,108 @@ class ScamReportModal(discord.ui.Modal, title="Report Trade Issue"):
             ephemeral=True
         )
 
+class ResolveReportModal(discord.ui.Modal, title="Resolve Report"):
+    def __init__(self, report_id: int):
+        super().__init__(timeout=None)
+        self.report_id = report_id
+
+        self.ban_success = discord.ui.TextInput(
+            label="Scammer ban successful? (yes/no)",
+            required=True,
+            max_length=5,
+            placeholder="yes / no"
+        )
+        self.side_notes = discord.ui.TextInput(
+            label="Side notes (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=800,
+            placeholder="Any extra details (what happened, actions taken, etc.)"
+        )
+
+        self.add_item(self.ban_success)
+        self.add_item(self.side_notes)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("This must be used in a report channel.", ephemeral=True)
+
+        report = get_report(self.report_id)
+        if not report:
+            return await interaction.response.send_message("Report record not found.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        # mark resolved in DB
+        resolve_report(self.report_id, interaction.user.id)
+
+        guild = interaction.guild
+        cfg = get_config(guild.id)
+        receipts_id = int(cfg["report_receipts_channel_id"] or 0)
+
+        ban_txt = str(self.ban_success.value).strip().lower()
+        ban_txt = "Yes ✅" if ban_txt in ("yes", "y") else ("No ❌" if ban_txt in ("no", "n") else ban_txt)
+
+        notes = str(self.side_notes.value).strip() if self.side_notes.value else ""
+
+        receipt_embed = discord.Embed(title="🧾 Report Receipt (Resolved)", color=discord.Color.green())
+        receipt_embed.add_field(name="Report ID", value=f"`{self.report_id}`", inline=True)
+        receipt_embed.add_field(name="Trade ID", value=f"`{report['trade_id']}`", inline=True)
+        receipt_embed.add_field(name="Resolved By", value=interaction.user.mention, inline=True)
+
+        receipt_embed.add_field(name="Scammer Ban Successful?", value=ban_txt, inline=False)
+
+        receipt_embed.add_field(name="Reporter", value=f"<@{int(report['reporter_id'])}>", inline=True)
+        receipt_embed.add_field(name="Opener", value=f"<@{int(report['opener_id'])}>", inline=True)
+        receipt_embed.add_field(name="Partner", value=f"<@{int(report['partner_id'])}>", inline=True)
+
+        receipt_embed.add_field(name="What happened", value=str(report["description"])[:1024], inline=False)
+
+        if report["trade_details"]:
+            receipt_embed.add_field(name="Trade details", value=str(report["trade_details"])[:1024], inline=False)
+        if report["proof_url"]:
+            receipt_embed.add_field(name="Proof", value=str(report["proof_url"])[:1024], inline=False)
+
+        if notes:
+            receipt_embed.add_field(name="Side notes", value=notes[:1024], inline=False)
+
+        # Send receipt (if configured)
+        if receipts_id:
+            receipts_ch = guild.get_channel(receipts_id)
+            if isinstance(receipts_ch, discord.TextChannel):
+                await receipts_ch.send(embed=receipt_embed)
+
+        # Delete the report channel
+        try:
+            await channel.delete(reason=f"Report {self.report_id} resolved by {interaction.user}")
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Saved receipt, but couldn't delete the channel: {e}", ephemeral=True)
+
+
 class ReportChannelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Mark Resolved (Staff)", style=discord.ButtonStyle.success, custom_id="report_mark_resolved")
+    @discord.ui.button(label="✅ Mark Resolved (Staff)", style=discord.ButtonStyle.success, custom_id="report_mark_resolved")
     async def mark_resolved(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
-            
-    @discord.ui.button(label="Delete Channel (No Receipt)", style=discord.ButtonStyle.secondary, custom_id="report_delete_no_receipt")
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("This must be used in a report channel.", ephemeral=True)
+
+        report_id = _parse_report_id_from_channel(channel)
+        if not report_id:
+            return await interaction.response.send_message("Couldn't find Report ID for this channel.", ephemeral=True)
+
+        await interaction.response.send_modal(ResolveReportModal(report_id))
+
+    @discord.ui.button(label="🗑️ Delete (No Receipt)", style=discord.ButtonStyle.secondary, custom_id="report_delete_no_receipt")
     async def delete_no_receipt(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
@@ -882,65 +974,13 @@ class ReportChannelView(discord.ui.View):
         if not report_id:
             return await interaction.response.send_message("Couldn't find Report ID for this channel.", ephemeral=True)
 
-        await interaction.response.send_message("🗑️ Deleting this report channel (no receipt will be posted).", ephemeral=True)
-
+        await interaction.response.send_message("🗑️ Deleting this report channel (no receipt will be sent).", ephemeral=True)
         try:
-            await channel.delete(reason=f"Report {report_id} deleted w/o receipt by {interaction.user.id}")
+            await channel.delete(reason=f"Report {report_id} deleted (no receipt) by {interaction.user}")
         except Exception as e:
-            logging.warning(f"Failed to delete report channel {channel.id}: {e}")
+            await interaction.followup.send(f"⚠️ Couldn't delete the channel: {e}", ephemeral=True)
 
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message("This must be used in a report channel.", ephemeral=True)
-
-        report_id = _parse_report_id_from_channel(channel)
-        if not report_id:
-            return await interaction.response.send_message("Couldn't find Report ID for this channel.", ephemeral=True)
-
-        report = get_report(report_id)
-        if not report:
-            return await interaction.response.send_message("Report record not found.", ephemeral=True)
-
-        # Update DB
-        resolve_report(report_id, interaction.user.id)
-
-        guild = interaction.guild
-        cfg = get_config(guild.id)
-        receipts_id = int(cfg["report_receipts_channel_id"] or 0)
-
-        receipt_embed = discord.Embed(title="🧾 Report Receipt (Resolved)", color=discord.Color.green())
-        receipt_embed.add_field(name="Report ID", value=f"`{report_id}`", inline=True)
-        receipt_embed.add_field(name="Trade ID", value=f"`{report['trade_id']}`", inline=True)
-        receipt_embed.add_field(name="Reporter", value=f"<@{int(report['reporter_id'])}>", inline=True)
-        # show both traders for context
-        receipt_embed.add_field(name="Opener", value=f"<@{int(report['opener_id'])}>", inline=True)
-        receipt_embed.add_field(name="Partner", value=f"<@{int(report['partner_id'])}>", inline=True)
-        receipt_embed.add_field(name="What happened", value=str(report["description"])[:1024], inline=False)
-
-        if report["trade_details"]:
-            receipt_embed.add_field(name="Trade details", value=str(report["trade_details"])[:1024], inline=False)
-        if report["proof_url"]:
-            receipt_embed.add_field(name="Proof", value=str(report["proof_url"])[:1024], inline=False)
-
-        receipt_embed.add_field(name="Resolved By", value=interaction.user.mention, inline=True)
-
-        sent_to = None
-        if receipts_id:
-            receipts_ch = guild.get_channel(receipts_id)
-            if isinstance(receipts_ch, discord.TextChannel):
-                await receipts_ch.send(embed=receipt_embed)
-                sent_to = receipts_ch
-
-        # confirm in-channel
-        note = "✅ Marked as resolved."
-        if sent_to:
-            note += f" Receipt posted in {sent_to.mention}."
-        else:
-            note += " (No receipts channel set — ask an admin to run `/set_report_receipts_channel`.)"
-
-        await interaction.response.send_message(note, ephemeral=True)
-
-    @discord.ui.button(label="Add Other Trader (Staff)", style=discord.ButtonStyle.secondary, custom_id="report_add_other_trader")
+    @discord.ui.button(label="➕ Add Other Trader (Staff)", style=discord.ButtonStyle.secondary, custom_id="report_add_other_trader")
     async def add_other_trader(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
@@ -948,8 +988,6 @@ class ReportChannelView(discord.ui.View):
             "Use `/report_add_user @user` in this report channel to add someone else to the channel.",
             ephemeral=True
         )
-
-# -------------------- Trade Views (Buttons) --------------------
 class PendingTradeView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1817,6 +1855,8 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 bot.run(TOKEN)
+
+
 
 
 
